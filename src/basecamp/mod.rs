@@ -80,9 +80,22 @@ const MAX_PROJECT_PAGES: u32 = 40;
 /// project that exceeds it logs a warning naming what was left out.
 const MAX_ENTRY_PAGES: u32 = 20;
 
+/// Pages one provider instance may fetch over its whole lifetime.
+///
+/// A provider is built per operation — one sync run, one write-back — so this
+/// caps what a single request can cost. It exists because an on-demand sync
+/// runs *inline in a guest slot-page request*: without it, a host with fifty
+/// projects would make that page walk fifty schedules sequentially. ~15 entries
+/// per page means this still covers a few dozen ordinary project schedules in
+/// full; past it, calendars keep their cached events and are reported as
+/// incomplete (so nothing is mistaken for deleted) and the next run picks up.
+const DEFAULT_PAGE_BUDGET: u32 = 60;
+
 /// Basecamp-backed calendar provider for a single Basecamp account.
 pub struct BasecampProvider {
     client: BasecampClient,
+    /// Pages this instance may still fetch. See [`DEFAULT_PAGE_BUDGET`].
+    page_budget: std::sync::atomic::AtomicU32,
 }
 
 impl BasecampProvider {
@@ -96,7 +109,19 @@ impl BasecampProvider {
         let (api_base, account_id) = split_account_url(url)?;
         Ok(Self {
             client: BasecampClient::new(&api_base, &account_id, access_token),
+            page_budget: std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_BUDGET),
         })
+    }
+
+    /// Claim one page from this instance's budget. `false` means the caller
+    /// must stop and report incomplete results.
+    fn take_page(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.page_budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
     }
 
     /// The Basecamp account id this provider talks to.
@@ -191,6 +216,12 @@ impl CalendarProvider for BasecampProvider {
     async fn list_calendars(&self) -> Result<Vec<RemoteCalendar>> {
         let mut out = Vec::new();
         for page_number in 1..=MAX_PROJECT_PAGES {
+            if !self.take_page() {
+                tracing::warn!(
+                    "Basecamp project listing stopped at the per-request page budget; later projects were not listed"
+                );
+                return Ok(out);
+            }
             let page = self.client.get_projects_page(page_number).await?;
             for project in &page.items {
                 if let Some(schedule) = project.schedule_dock_id() {
@@ -314,6 +345,15 @@ impl BasecampProvider {
         let mut complete = false;
 
         for page_number in 1..=MAX_ENTRY_PAGES {
+            if !self.take_page() {
+                // Out of budget rather than out of pages: same consequence —
+                // an incomplete snapshot — so it takes the same exit.
+                tracing::warn!(
+                    calendar = %calendar_id,
+                    "Basecamp entry fetch stopped at the per-request page budget; snapshot is incomplete"
+                );
+                break;
+            }
             let page = self
                 .client
                 .get_schedule_entries_page(project_id, schedule_id, page_number)
@@ -372,6 +412,14 @@ impl BasecampProvider {
         }
 
         for page_number in 1..=MAX_ENTRY_PAGES {
+            if !self.take_page() {
+                tracing::warn!(
+                    uid = %uid,
+                    project_id = project_id,
+                    "Basecamp entry lookup stopped at the per-request page budget"
+                );
+                return Ok(None);
+            }
             let page = self
                 .client
                 .get_schedule_entries_page(project_id, schedule_id, page_number)
@@ -516,6 +564,30 @@ mod tests {
 
         println!("\nRead/write smoke test PASSED.");
         Ok(())
+    }
+
+    #[test]
+    fn page_budget_is_consumed_then_exhausted() {
+        let p = BasecampProvider::new("https://3.basecampapi.com/1234567", "tok").unwrap();
+        for _ in 0..DEFAULT_PAGE_BUDGET {
+            assert!(p.take_page());
+        }
+        // The budget bounds one request's cost; past it the caller must report
+        // incomplete results rather than keep walking.
+        assert!(!p.take_page());
+        assert!(!p.take_page(), "exhausted budget must not wrap around");
+    }
+
+    #[test]
+    fn each_provider_gets_a_fresh_budget() {
+        // A write-back provider is built per operation, so a sync that spent
+        // its budget must not starve the next booking's put/delete.
+        let a = BasecampProvider::new("https://3.basecampapi.com/1", "tok").unwrap();
+        for _ in 0..DEFAULT_PAGE_BUDGET {
+            assert!(a.take_page());
+        }
+        let b = BasecampProvider::new("https://3.basecampapi.com/1", "tok").unwrap();
+        assert!(b.take_page());
     }
 
     #[test]

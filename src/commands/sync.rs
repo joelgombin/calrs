@@ -510,7 +510,21 @@ pub async fn sync_provider_source(
     provider: &dyn crate::providers::CalendarProvider,
     source_id: &str,
 ) -> Result<()> {
-    let calendars = provider.list_calendars().await?;
+    let calendars = match provider.list_calendars().await {
+        Ok(c) => c,
+        Err(e) => {
+            // Stamp the attempt even though it failed, so the staleness window
+            // backs the source off. On-demand syncs run inline in guest slot
+            // pages: without this, a rate-limited or unreachable back-end would
+            // have every page request retry the whole walk.
+            let _ =
+                sqlx::query("UPDATE caldav_sources SET last_synced = datetime('now') WHERE id = ?")
+                    .bind(source_id)
+                    .execute(pool)
+                    .await;
+            return Err(e);
+        }
+    };
 
     // Bounded fetch window. Matches the CalDAV path's FULL_FETCH_LOOKBACK_DAYS:
     // 90 days back is plenty for orphan reconciliation and keeps responses

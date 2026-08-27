@@ -386,7 +386,7 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
 <div class="card">
   <h2>Basecamp (OAuth2)</h2>
   <div style="margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
-    Status: {% if basecamp_oauth2_configured %}<strong style="color: var(--success);">configured</strong>{% else %}<span style="color: var(--text-muted);">not configured</span>{% endif %}
+    Status: {% if basecamp_oauth2_configured %}<strong style="color: var(--success);">configured</strong>{% elif basecamp_oauth2_client_id %}<span style="color: var(--error-text);">incomplete — client secret missing</span>{% else %}<span style="color: var(--text-muted);">not configured</span>{% endif %}
     {% if basecamp_oauth2_client_id %}&middot; Client ID: <span style="color: var(--text-muted);">{{ basecamp_oauth2_client_id }}</span>{% endif %}
   </div>
   <form method="post" action="/dashboard/admin/basecamp-oauth2">

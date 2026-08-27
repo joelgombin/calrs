@@ -84,7 +84,9 @@ Two levels, most specific wins:
    right after connecting.
 2. **Per event type** (*Event type form → Write bookings to*): overrides the
    source default for that event type only. This is how "30-minute intros go
-   to the Sales project, workshops go to Delivery" is expressed.
+   to the Sales project, workshops go to Delivery" is expressed. Available on
+   personal **and** team event types; the picker lists the calendars *you* own,
+   since you cannot aim someone else's.
 
 The picker lists every calendar you own across all your sources, so an event
 type can equally be pinned to a CalDAV calendar — Basecamp is just the case
@@ -130,10 +132,13 @@ to notify anyone. That keeps a booking from double-notifying the host.
   still cheap: a booking page only re-syncs a source older than five minutes,
   and only calendars left marked *busy* are fetched at all — untick the
   projects you do not schedule around and they stop costing anything.
-  Coverage is capped at 20 pages per project (~300 entries). Past that, the
-  sync keeps what it read but stops reconciling deletions for that project
-  (logged as `snapshot is incomplete`), because treating the unread tail as
-  "these events were deleted" would cancel the bookings behind them.
+  Coverage is capped two ways: 20 pages per project (~300 entries), and 60
+  pages per sync run — an on-demand sync happens inline in a guest's slot-page
+  request, so its cost has to be bounded whether the host has three projects or
+  fifty. Past either cap the sync keeps what it read but stops reconciling
+  deletions for that project (logged as `snapshot is incomplete`), because
+  treating the unread tail as "these events were deleted" would cancel the
+  bookings behind them; the next run continues.
 - **Recurring Basecamp entries block only their first occurrence.** Basecamp
   models recurrence with its own `recurrence_schedule` object rather than an
   iCalendar `RRULE`, and listings return the series head. Translating that
@@ -155,10 +160,11 @@ to notify anyone. That keeps a booking from double-notifying the host.
 
 | Symptom | Cause |
 |---|---|
-| "Basecamp integration is not configured" | No client ID saved in **Admin → Basecamp (OAuth2)**. |
+| "Basecamp integration is not fully configured" | The client ID or the client secret is missing in **Admin → Basecamp (OAuth2)**. The card shows *incomplete — client secret missing* when only the ID is stored; the Connect button stays disabled, because authorizing against a half-configured app spends the authorization code before the exchange can fail. |
 | "The public base URL is not configured" | `CALRS_BASE_URL` is unset, so the redirect URI cannot be built. |
 | Token exchange fails right after authorizing | Redirect URI mismatch, or a wrong client secret. Compare the value in the admin panel with the app registration character by character. |
 | "That Basecamp login has no current-generation Basecamp account" | The login only has legacy 37signals products, which have no schedule API. |
 | A project is missing from the calendar list | Its Schedule tool is disabled, or the authorizing user cannot see the project. |
 | Bookings are not appearing in Basecamp | No write calendar selected. Check the source's write-back calendar, and the event type's **Write bookings to** if it is pinned. The log line to look for is `calendar write-back skipped`. |
-| "Basecamp rate limit hit" in the logs | The account is over 37signals' burst limit. calrs retries once for a short `Retry-After` and then backs off; the next sync picks up where it left off. |
+| "Basecamp rate limit hit" in the logs | The account is over 37signals' burst limit. calrs retries once for a short `Retry-After` and then backs off; the next sync picks up where it left off. A failed sync still stamps the attempt, so slot pages wait out the five-minute staleness window instead of retrying the walk on every request. |
+| `stopped at the per-request page budget` in the logs | One sync run hit the 60-page budget. Untick the *busy* flag on projects that are not your own time (**Calendar sources**) — non-busy calendars are not fetched at all. |
