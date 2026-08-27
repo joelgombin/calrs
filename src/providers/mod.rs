@@ -15,8 +15,10 @@ use async_trait::async_trait;
 
 pub mod caldav;
 pub mod factory;
+pub mod source;
 
 pub use factory::build_provider;
+pub use source::{build_for_source, SourceCredentials};
 
 /// A calendar discovered on a remote provider.
 ///

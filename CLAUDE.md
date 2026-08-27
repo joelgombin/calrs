@@ -19,7 +19,7 @@
 | Async runtime | `tokio` (full features) | Used throughout |
 | Database | SQLite via `sqlx` 0.7 | WAL mode, foreign keys enabled, migrations inlined |
 | HTTP client | `reqwest` (rustls, no openssl) | CalDAV PROPFIND/REPORT and EWS SOAP requests |
-| Calendar providers | trait `CalendarProvider` (`src/providers/`) | Pluggable back-ends: CalDAV, EWS (Exchange 2019). Sync/source code dispatches via the trait. |
+| Calendar providers | trait `CalendarProvider` (`src/providers/`) | Pluggable back-ends: CalDAV, EWS (Exchange 2019), Basecamp. Sync/source code dispatches via the trait. |
 | Async traits | `async-trait` 0.1 | Object-safe `dyn CalendarProvider`. |
 | XML parsing | `quick-xml` 0.31 | CalDAV responses are XML over WebDAV |
 | iCal | `icalendar` crate | Parsing/generating VEVENT data |
@@ -95,13 +95,14 @@ calrs/
 │   ├── 042_event_transp.sql      ← TRANSP column on events (skip TRANSPARENT)
 │   ├── 043_event_type_watchers.sql ← event_type_watchers junction (team watches event type)
 │   ├── 044_booking_claim.sql     ← claimed_by_user_id/claimed_at on bookings + booking_claim_tokens
-│   ├── 055_provider_type.sql     ← provider_type on caldav_sources (caldav/ews) for the calendar-provider abstraction
+│   ├── 055_provider_type.sql     ← provider_type on caldav_sources (caldav/ews/basecamp) for the calendar-provider abstraction
 │   ├── 056_meeting_links.sql     ← jitsi + webhook meeting-provider columns on auth_config
 │   ├── 057_runtime_settings.sql  ← base_url + allow_private_hosts on auth_config (env-overridable runtime settings)
 │   ├── 058_resources.sql         ← shared resources: resources, resource_events, event_type_resources; resource_scheduling_mode, assigned_resource_id, lend_resource_write
 │   ├── 059_resource_sync_error.sql ← last_sync_error on resources (feed failure indicator)
 │   ├── 062_sms_notifications.sql ← SMS: guest_phone on bookings, sms_phone_mode on event_types, sms_config + sms_usage tables, sms_allow_all_users on auth_config
-│   └── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
+│   ├── 063_booking_horizon.sql   ← booking_horizon_days on event_types (NULL = unlimited)
+│   └── 064_basecamp.sql          ← Basecamp OAuth2 app credentials on auth_config; write_calendar_id on event_types (per-event-type write target)
 ├── templates/
 │   ├── base.html                 ← base layout + CSS (light/dark mode)
 │   ├── dashboard_base.html       ← sidebar layout (extends base.html, all dashboard pages extend this)
@@ -165,6 +166,11 @@ calrs/
     │   ├── sevenio.rs            ← seven.io adapter (HTTP 200 + in-body error codes)
     │   └── webhook.rs            ← generic webhook adapter (bring your own gateway, HMAC-signed)
     ├── utils.rs                  ← shared utilities: split_vevents(), extract_vevent_field()
+    ├── basecamp/                 ← Basecamp connector (read + write), provider-trait back-end
+    │   ├── mod.rs                ← BasecampProvider: projects → calendars, schedule entries → events
+    │   ├── client.rs             ← JSON API plumbing: bearer auth, User-Agent, pagination, 429 retry
+    │   ├── ical.rs               ← schedule entry ⇄ iCalendar + the `[calrs-uid:…]` round-trip marker
+    │   └── oauth.rs              ← 37signals Launchpad OAuth 2: auth URL, code exchange, refresh, identity
     ├── caldav/
     │   └── mod.rs                ← CalDAV client: discovery, calendar list, event fetch, write-back
     ├── web/
@@ -193,10 +199,10 @@ Key tables:
 - **`sessions`** — server-side sessions: token (PK), user_id, expires_at (30-day TTL)
 - **`auth_config`** — singleton: registration_enabled, allowed_email_domains, OIDC settings (issuer, client_id, client_secret, auto_register)
 - **`accounts`** — scheduling accounts linked to users via `user_id`
-- **`caldav_sources`** — CalDAV server connections (URL, credentials, sync state, `write_calendar_href`). `enabled` flag, `ON DELETE CASCADE`
+- **`caldav_sources`** — calendar back-end connections, one row per remote account whatever the protocol (URL, credentials, sync state, `write_calendar_href`, `provider_type` = caldav/ews/basecamp). `enabled` flag, `ON DELETE CASCADE`
 - **`calendars`** — calendar collections discovered under a source; `is_busy=1` means events block availability
 - **`events`** — cached remote events from CalDAV sync; unique on `(uid, calendar_id, COALESCE(recurrence_id, ''))`, stores `raw_ical`, `etag`, `rrule`, `all_day`, `timezone`, `recurrence_id`, `status`
-- **`event_types`** — bookable meeting templates (slug unique per account, `duration_min`, `buffer_before`/`buffer_after`, `min_notice_min`, `location_type`/`location_value`, `requires_confirmation`, `visibility` (public/internal/private), `max_additional_guests`, `group_id` (legacy), `team_id` (unified teams FK), `created_by_user_id`, `reminder_minutes`, `scheduling_mode` (round_robin/collective), `default_calendar_view` (month/week/column), `first_slot_only` (boolean))
+- **`event_types`** — bookable meeting templates (slug unique per account, `duration_min`, `buffer_before`/`buffer_after`, `min_notice_min`, `location_type`/`location_value`, `requires_confirmation`, `visibility` (public/internal/private), `max_additional_guests`, `group_id` (legacy), `team_id` (unified teams FK), `created_by_user_id`, `reminder_minutes`, `scheduling_mode` (round_robin/collective), `default_calendar_view` (month/week/column), `first_slot_only` (boolean), `write_calendar_id` (FK `calendars`, NULL = use each source's default write calendar))
 - **`availability_rules`** — weekly recurring windows per event type (day_of_week 0=Sun…6=Sat, HH:MM times)
 - **`availability_overrides`** — date-specific exceptions (day off, special hours). `is_blocked` flag
 - **`bookings`** — bookings with `uid` (iCal), guest info, status (confirmed/pending/cancelled/declined), `cancel_token`/`reschedule_token`/`confirm_token`, `assigned_user_id` (for group round-robin), `caldav_calendar_href` (write-back tracking), `reminder_sent_at` (tracks when reminder email was sent)
@@ -316,7 +322,7 @@ File: `src/web/mod.rs`, templates in `templates/`
 
 **Email notifications:** Booking confirmation, cancellation, pending notice, approval request (with action buttons), decline notice — all HTML emails with plain text fallback. Confirmation and cancellation include `.ics` calendar invite attachments. Location included in emails and ICS.
 
-**CalDAV write-back:** Confirmed bookings are pushed to the host's CalDAV calendar (if `write_calendar_href` is configured on the source). On cancellation, the event is deleted from CalDAV.
+**Calendar write-back:** Confirmed bookings are pushed to the host's calendar — CalDAV, EWS or Basecamp, whichever the source speaks — if `write_calendar_href` is configured on the source, or if the event type pins a calendar via `write_calendar_id` (see the Basecamp connector section). On cancellation the event is removed again.
 
 **Security hardening (1.0):**
 - **CSRF protection** — double-submit cookie pattern on all 31 POST handlers via `csrf_cookie_middleware`. Client-side JS injects `_csrf` hidden field. Multipart forms use query parameter.
@@ -458,6 +464,32 @@ Because `--surface`, `--border`, etc. are already overridden by `html.dark { ...
 **CLI:** `calrs resource probe --url <URL> [--username U] [--write-test]` probes a feed or CalDAV collection (full RFC 4791 discovery fallback, write test with a temporary event). Known gap: `calrs event-type slots` and `calrs booking create` do not consult resources yet; the web paths do.
 
 **Files:** `src/resources.rs` (core logic + tests), `src/web/mod.rs` (admin handlers, booking wiring, write-back), `src/commands/resource.rs` (probe CLI), `migrations/058_resources.sql`, `templates/admin.html`, `templates/event_type_form.html`, `templates/settings.html`, `templates/troubleshoot.html`.
+
+---
+
+## Basecamp connector
+
+**Concept:** Basecamp (37signals) as a first-class calendar back-end, read *and* write, through the `CalendarProvider` trait rather than CalDAV — Basecamp has no CalDAV. One Basecamp **account** is one `caldav_sources` row; one **project with its Schedule tool enabled** is one `calendars` row; one **schedule entry** is one `events` row. The calendar id is the opaque pair `"{project_id}/{schedule_id}"`, which is what lets write-back address the right project without an extra lookup.
+
+**Auth:** OAuth 2 via 37signals Launchpad, reusing the columns the Google CalDAV integration added (`auth_type='oauth2'`, `oauth2_provider='basecamp'`, `access_token_enc`, `refresh_token_enc`, `token_expires_at`). Launchpad predates the standard parameter names: the grant is selected with `type=web_server` / `type=refresh`, not `grant_type` — confirmed against 37signals' own SDK (`basecamp/basecamp-sdk`, `oauth.Exchanger`), not guessed. App credentials are instance-wide in `auth_config.basecamp_oauth2_client_id` / `_client_secret` (secret encrypted, keep-current on save), configured at `/dashboard/admin`; hosts then connect their own account from the source form. A login with several Basecamp accounts gets one source per account — the tokens are identity-scoped, so this needs no picker and no extra state. Re-connecting refreshes an existing source rather than duplicating it.
+
+**Read path:** `list_calendars` walks `GET /projects.json` and keeps projects whose dock has an enabled `schedule` tool. `fetch_events{,_since}` pages `GET /buckets/{p}/schedules/{s}/entries.json` and synthesises a VEVENT per entry. There is no server-side time filter and no delta cursor, so `sync_delta` returns an empty delta (`stored_sync_state` stays NULL) and every sync is a bounded full fetch — the same shape as EWS. The response order is undocumented (37signals' own CLI sorts client side), so pagination does **not** stop early on an out-of-window page — that would risk discarding exactly the future entries availability depends on. It walks to a short page or to `MAX_ENTRY_PAGES` (20, ~300 entries) and logs when the cap truncates coverage. Recurring entries are read as single events: Basecamp models recurrence with a `recurrence_schedule` object rather than an RRULE, and a wrong translation would silently mis-block availability, so it is documented rather than approximated.
+
+**Write path:** `put_event` translates the ICS calrs already generates for CalDAV write-back into a schedule-entry payload and creates it (`POST …/entries.json`) or replaces it in place (`PUT …/schedule_entries/{id}.json`), so a reschedule keeps the entry and its comments. `delete_event` trashes the recording (`PUT …/recordings/{id}/status/trashed.json` — Basecamp has no DELETE). `notify` is always false: calrs sends its own emails.
+
+**The UID round trip** (`basecamp/ical.rs`): Basecamp entries have no UID field, and calrs addresses events by iCal UID. Entries originating in Basecamp get the synthetic UID `bc-{entry_id}@basecamp`, so a later put/delete parses the entry id straight back out. Entries calrs creates keep the booking's own UID, recorded in the entry description as `[calrs-uid:…]` and matched by scanning the schedule. The marker is visible plain text, not an HTML comment, because Basecamp sanitises rich text on the way in and a stripped comment would orphan every booking.
+
+**Where the booking lands** — two levels, most specific wins:
+- **Per source**: `caldav_sources.write_calendar_href`, the existing default, set right after connecting.
+- **Per event type**: `event_types.write_calendar_id` (migration 064) overrides it for that event type only — "intros into Sales, workshops into Delivery". `write_targets_for_user()` resolves pin-or-defaults; `event_type_pinned_write_target()` also returns the pin's *owner*, so a team event type pinned to a shared project schedule is written there **in addition to** the assigned member's own calendar (their calendar is what keeps availability honest, the project schedule is what makes the meeting visible). The picker only offers calendars the editing user owns, and a blank submission carries a pin forward when the editor cannot see it — a team-mate's choice must not vanish because someone else saved the form. `ON DELETE SET NULL` means deleting a calendar falls back to the source default rather than silently dropping write-back.
+
+**Dispatch:** adding a second non-CalDAV back-end retired the `if provider_type == EWS { … } else { caldav }` pattern. `factory::uses_generic_provider()` answers "does this go through the trait?", and `providers::source::build_for_source()` is the one place that resolves a source row's credentials (decrypt a password, or refresh an OAuth 2 token) into a ready provider. CalDAV keeps its own path for the optimisations the trait doesn't express (ctag skip, RFC 6578 sync-token, `time-range` REPORTs). `commands::sync::sync_ews_source` is now `sync_provider_source`.
+
+**API notes:** `User-Agent` with an app name *and* a contact is mandatory (Basecamp answers 400 without it) — built from the instance base URL. 429 is retried once when `Retry-After` is short, then surfaced. Redirects are not followed, so a bearer token is never replayed onto an unvalidated host. Error bodies are truncated (on a char boundary) before they reach the logs.
+
+**Files:** `src/basecamp/{mod,client,ical,oauth}.rs`, `src/providers/source.rs`, `src/providers/factory.rs`, `migrations/064_basecamp.sql`, `templates/{admin,source_form,event_type_form}.html`, `docs/src/basecamp.md`. Dashboard/admin strings are English, like the rest of that surface.
+
+**CLI:** Basecamp sources are created by the web OAuth flow only (`calrs source add basecamp` says so and exits). `calrs sync`, `source list` and `source test` work through the shared dispatch.
 
 ---
 

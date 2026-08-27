@@ -7,6 +7,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod auth;
+mod basecamp;
 mod caldav;
 mod commands;
 mod crypto;

@@ -104,6 +104,12 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
             no_test,
         } => {
             let provider = provider.trim().to_ascii_lowercase();
+            if provider == factory::kinds::BASECAMP {
+                bail!(
+                    "Basecamp sources are created by the OAuth flow in the web dashboard \
+                     (Calendar sources → Basecamp → Connect), not from the CLI."
+                );
+            }
             if provider != factory::kinds::CALDAV && provider != factory::kinds::EWS {
                 bail!("unknown provider '{}'. Use 'caldav' or 'ews'.", provider);
             }
@@ -363,33 +369,24 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], cmd: SourceCommands) -> Resu
                         factory::label(&provider_type)
                     );
 
-                    // OAuth2 sources are CalDAV-only (Google). Basic-auth
-                    // sources may be CalDAV or EWS; let the provider factory
-                    // pick the right back-end.
-                    let client: Box<dyn crate::providers::CalendarProvider> =
-                        if auth_type == "oauth2" {
-                            let caldav = crate::oauth2_caldav::build_client_for_source(
-                                pool,
-                                key,
-                                &source_id,
-                                &url,
-                                &auth_type,
-                                &username,
-                                password_enc.as_deref(),
-                                access_token_enc.as_deref(),
-                                token_expires_at.as_deref(),
-                            )
-                            .await?;
-                            Box::new(crate::providers::caldav::CaldavProvider::from_client(
-                                caldav,
-                            ))
-                        } else {
-                            let enc = password_enc.as_deref().ok_or_else(|| {
-                                anyhow::anyhow!("Basic auth source missing password")
-                            })?;
-                            let password = crate::crypto::decrypt_password(key, enc)?;
-                            build_provider(&provider_type, &url, &username, &password)?
-                        };
+                    // One resolver for every back-end: it decrypts a stored
+                    // password or refreshes an OAuth 2 token as the source
+                    // requires, and returns the matching provider.
+                    let client = crate::providers::build_for_source(
+                        pool,
+                        key,
+                        &source_id,
+                        &crate::providers::SourceCredentials {
+                            provider_type: &provider_type,
+                            url: &url,
+                            username: &username,
+                            auth_type: &auth_type,
+                            password_enc: password_enc.as_deref(),
+                            access_token_enc: access_token_enc.as_deref(),
+                            token_expires_at: token_expires_at.as_deref(),
+                        },
+                    )
+                    .await?;
                     match client.check_connection().await {
                         Ok(true) => println!("{} Connection OK", "✓".green()),
                         Ok(false) => println!("{} Connected, partial detection", "⚠".yellow()),

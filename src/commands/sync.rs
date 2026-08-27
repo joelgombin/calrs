@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::caldav::{CaldavClient, RawEvent};
-use crate::providers::{factory::kinds, RawEvent as ProviderRawEvent};
+use crate::providers::{factory, RawEvent as ProviderRawEvent};
 use crate::utils::{extract_vevent_field, extract_vevent_tzid, split_vevents};
 
 /// Default staleness threshold: 5 minutes
@@ -75,26 +75,28 @@ pub async fn run(pool: &SqlitePool, key: &[u8; 32], full: bool) -> Result<()> {
             .await;
         }
 
-        // EWS sources go through the provider trait (no OAuth2, no CalDAV-only
-        // sync-collection); CalDAV sources keep the existing flow.
-        if provider_type == kinds::EWS {
-            let password =
-                match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        println!("  {} Decrypt failed: {}", "✗".red(), e);
-                        continue;
-                    }
-                };
+        // Non-CalDAV back-ends (EWS, Basecamp) go through the provider trait;
+        // CalDAV sources keep the existing flow with its ctag / sync-token
+        // optimisations.
+        if factory::uses_generic_provider(provider_type) {
+            let creds = crate::providers::SourceCredentials {
+                provider_type,
+                url,
+                username,
+                auth_type,
+                password_enc: password_enc.as_deref(),
+                access_token_enc: access_token_enc.as_deref(),
+                token_expires_at: token_expires_at.as_deref(),
+            };
             let provider =
-                match crate::providers::build_provider(provider_type, url, username, &password) {
+                match crate::providers::build_for_source(pool, key, source_id, &creds).await {
                     Ok(p) => p,
                     Err(e) => {
                         println!("  {} Provider build failed: {}", "✗".red(), e);
                         continue;
                     }
                 };
-            if let Err(e) = sync_ews_source(pool, key, provider.as_ref(), source_id).await {
+            if let Err(e) = sync_provider_source(pool, key, provider.as_ref(), source_id).await {
                 println!("  {} Sync failed: {}", "✗".red(), e);
             }
             continue;
@@ -370,18 +372,24 @@ pub async fn sync_if_stale(pool: &SqlitePool, key: &[u8; 32], user_id: &str) {
             continue;
         }
 
-        if provider_type == kinds::EWS {
-            let password =
-                match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-            let provider =
-                match crate::providers::build_provider(provider_type, url, username, &password) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-            let _ = sync_ews_source(pool, key, provider.as_ref(), source_id).await;
+        if factory::uses_generic_provider(provider_type) {
+            let creds = crate::providers::SourceCredentials {
+                provider_type,
+                url,
+                username,
+                auth_type,
+                password_enc: password_enc.as_deref(),
+                access_token_enc: access_token_enc.as_deref(),
+                token_expires_at: token_expires_at.as_deref(),
+            };
+            match crate::providers::build_for_source(pool, key, source_id, &creds).await {
+                Ok(provider) => {
+                    let _ = sync_provider_source(pool, key, provider.as_ref(), source_id).await;
+                }
+                Err(e) => {
+                    tracing::warn!(source_id = %source_id, error = %e, "on-demand sync skipped: could not build provider");
+                }
+            }
             continue;
         }
 
@@ -448,18 +456,24 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
                 .await;
     }
 
-    if provider_type == kinds::EWS {
-        let password =
-            match crate::crypto::decrypt_password(key, password_enc.as_deref().unwrap_or("")) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        let provider =
-            match crate::providers::build_provider(&provider_type, &url, &username, &password) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-        let _ = sync_ews_source(pool, key, provider.as_ref(), source_id).await;
+    if factory::uses_generic_provider(&provider_type) {
+        let creds = crate::providers::SourceCredentials {
+            provider_type: &provider_type,
+            url: &url,
+            username: &username,
+            auth_type: &auth_type,
+            password_enc: password_enc.as_deref(),
+            access_token_enc: access_token_enc.as_deref(),
+            token_expires_at: token_expires_at.as_deref(),
+        };
+        match crate::providers::build_for_source(pool, key, source_id, &creds).await {
+            Ok(provider) => {
+                let _ = sync_provider_source(pool, key, provider.as_ref(), source_id).await;
+            }
+            Err(e) => {
+                tracing::warn!(source_id = %source_id, error = %e, "background sync skipped: could not build provider");
+            }
+        }
         return;
     }
 
@@ -482,13 +496,15 @@ pub async fn sync_source_by_id(pool: &SqlitePool, key: &[u8; 32], source_id: &st
     let _ = sync_source(pool, key, &client, source_id).await;
 }
 
-/// EWS-specific sync path using the [`crate::providers::CalendarProvider`]
-/// trait. CalDAV sources keep going through [`sync_source`], which retains
-/// CalDAV-only optimisations (ctag, RFC 6578 sync-token, time-range queries,
-/// hardened orphan reconciliation). The EWS path is intentionally simpler:
-/// list folders, fetch each one in full, and reconcile by UID. Delta sync is a
-/// known follow-up — see `EwsProvider::sync_delta`.
-pub async fn sync_ews_source(
+/// Sync path for every back-end that speaks the
+/// [`crate::providers::CalendarProvider`] trait (EWS, Basecamp). CalDAV
+/// sources keep going through [`sync_source`], which retains CalDAV-only
+/// optimisations (ctag, RFC 6578 sync-token, time-range queries, hardened
+/// orphan reconciliation). This path is intentionally simpler: list calendars,
+/// fetch each one over a bounded window, and reconcile by UID. Delta sync is a
+/// known follow-up for both — see `EwsProvider::sync_delta` and
+/// `BasecampProvider::sync_delta`.
+pub async fn sync_provider_source(
     pool: &SqlitePool,
     key: &[u8; 32],
     provider: &dyn crate::providers::CalendarProvider,
@@ -497,9 +513,10 @@ pub async fn sync_ews_source(
     let calendars = provider.list_calendars().await?;
 
     // Bounded fetch window. Matches the CalDAV path's FULL_FETCH_LOOKBACK_DAYS:
-    // 90 days back is plenty for orphan reconciliation and keeps EWS response
-    // sizes predictable. The provider's fetch_events_since uses CalendarView,
-    // which expands recurrences server-side within the window.
+    // 90 days back is plenty for orphan reconciliation and keeps responses
+    // predictable. EWS filters server-side via CalendarView (which also expands
+    // recurrences); Basecamp has no time filter and bounds its own pagination
+    // against the same window.
     let since_dt = Utc::now() - chrono::Duration::days(FULL_FETCH_LOOKBACK_DAYS);
     let since_iso = since_dt.to_rfc3339();
     let since_prefix = since_dt.format("%Y%m%d").to_string();
@@ -513,13 +530,13 @@ pub async fn sync_ews_source(
             Ok(raw_events) => {
                 let count = upsert_provider_events(pool, &cal_id, &raw_events).await;
                 let deleted =
-                    remove_orphaned_ews_events(pool, key, &cal_id, &raw_events, &since_prefix)
+                    remove_orphaned_provider_events(pool, key, &cal_id, &raw_events, &since_prefix)
                         .await;
                 if deleted > 0 {
                     tracing::info!(
                         calendar_name = cal_label,
                         stale_events_removed = deleted,
-                        "removed stale EWS events from local cache"
+                        "removed stale provider events from local cache"
                     );
                 }
                 println!(
@@ -548,12 +565,13 @@ pub async fn sync_ews_source(
         .bind(source_id)
         .execute(pool)
         .await?;
-    tracing::info!(source_id = %source_id, "EWS sync completed");
+    tracing::info!(source_id = %source_id, "provider sync completed");
     Ok(())
 }
 
-/// Provider-trait equivalent of [`upsert_calendar`]. EWS uses opaque folder
-/// IDs in the `href` column; the `id` field on `RemoteCalendar` is reused.
+/// Provider-trait equivalent of [`upsert_calendar`]. The `href` column holds
+/// whatever opaque id the back-end uses (an EWS folder Id, a Basecamp
+/// `"{project}/{schedule}"` pair); the `id` field on `RemoteCalendar` is reused.
 async fn upsert_calendar_provider(
     pool: &SqlitePool,
     source_id: &str,
@@ -661,16 +679,16 @@ async fn upsert_provider_events(
     count
 }
 
-/// EWS variant of orphan reconciliation, scoped to the fetched window.
+/// Provider-trait variant of orphan reconciliation, scoped to the fetched window.
 /// `since_prefix` is a `YYYYMMDD` lower bound matching the
 /// `fetch_events_since` call: events with `start_at` before it weren't in
 /// the response and must not be flagged as orphans. Pass an empty string to
 /// reconcile against every local event.
 ///
-/// `client = None` is implied: EWS sources can't be HTTP-verified against a
-/// `CaldavClient`, so we go straight to DB cancellation when an event has
-/// vanished from the server.
-async fn remove_orphaned_ews_events(
+/// `client = None` is implied: a non-CalDAV source can't be HTTP-verified
+/// against a `CaldavClient`, so we go straight to DB cancellation when an event
+/// has vanished from the server.
+async fn remove_orphaned_provider_events(
     pool: &SqlitePool,
     key: &[u8; 32],
     cal_id: &str,

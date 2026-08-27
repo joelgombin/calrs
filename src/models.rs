@@ -57,6 +57,11 @@ pub struct AuthConfig {
     pub oidc_auto_register: bool,
     pub google_oauth2_client_id: Option<String>,
     pub google_oauth2_client_secret: Option<String>,
+    pub basecamp_oauth2_client_id: Option<String>,
+    /// Encrypted at rest like every other stored secret; skipped on
+    /// serialization so it cannot ride out in a JSON response by accident.
+    #[serde(skip)]
+    pub basecamp_oauth2_client_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
