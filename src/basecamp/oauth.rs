@@ -17,6 +17,12 @@ use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 
+/// Timeout for a Launchpad call. These run inline in web handlers (a token
+/// refresh happens on the first sync or write-back of a stale source, and a
+/// slot page can trigger one), so a stalled endpoint must fail rather than
+/// hold the request open.
+const LAUNCHPAD_TIMEOUT_SECS: u64 = 20;
+
 const LAUNCHPAD_BASE: &str = "https://launchpad.37signals.com";
 const AUTHORIZE_PATH: &str = "/authorization/new";
 const TOKEN_PATH: &str = "/authorization/token";
@@ -28,6 +34,17 @@ const REFRESH_BUFFER_SECS: i64 = 300;
 
 /// `oauth2_provider` value identifying a Basecamp source.
 pub const PROVIDER: &str = "basecamp";
+
+/// HTTP client for Launchpad: bounded, and following no redirects — these
+/// requests carry the client secret and the refresh token, which must never be
+/// replayed onto whatever host a 30x names.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(LAUNCHPAD_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
+}
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -67,7 +84,7 @@ pub fn build_auth_url(client_id: &str, redirect_uri: &str, state: &str) -> Strin
 }
 
 async fn post_token(op: &str, form: &[(&str, &str)]) -> Result<TokenResponse> {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(format!("{}{}", LAUNCHPAD_BASE, TOKEN_PATH))
         .header(reqwest::header::USER_AGENT, super::client::user_agent())
         .form(form)
@@ -116,7 +133,7 @@ pub async fn exchange_code(
 
 /// Fetch the authorizing identity and the accounts it can reach.
 pub async fn fetch_identity(access_token: &str) -> Result<Identity> {
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .get(format!("{}{}", LAUNCHPAD_BASE, IDENTITY_PATH))
         .bearer_auth(access_token)
         .header(reqwest::header::USER_AGENT, super::client::user_agent())
@@ -250,28 +267,43 @@ pub async fn refresh_access_token(
     let expires_at =
         chrono::Utc::now() + chrono::Duration::seconds(token.expires_in.unwrap_or(1_209_600));
     let access_enc = crate::crypto::encrypt_password(key, &token.access_token)?;
-    sqlx::query(
-        "UPDATE caldav_sources SET access_token_enc = ?, token_expires_at = ? WHERE id = ?",
-    )
-    .bind(&access_enc)
-    .bind(expires_at.to_rfc3339())
-    .bind(source_id)
-    .execute(pool)
-    .await?;
 
-    // Launchpad may hand back a rotated refresh token; persisting it keeps the
-    // next refresh from failing on a token the server has already retired.
-    if let Some(new_refresh) = token.refresh_token {
-        if let Ok(enc) = crate::crypto::encrypt_password(key, &new_refresh) {
+    // Launchpad tokens are scoped to the *identity*, not to one Basecamp
+    // account, and a login with several accounts becomes several sources that
+    // share the pair. So the new token is written to all of them: otherwise a
+    // rotated refresh token would strand every sibling on a value Launchpad has
+    // already retired, and each sibling would burn its own refresh call.
+    let siblings = sibling_source_ids(pool, source_id).await;
+    let refresh_enc = match token.refresh_token.as_deref() {
+        Some(new_refresh) => crate::crypto::encrypt_password(key, new_refresh).ok(),
+        None => None,
+    };
+
+    for id in &siblings {
+        sqlx::query(
+            "UPDATE caldav_sources SET access_token_enc = ?, token_expires_at = ? WHERE id = ?",
+        )
+        .bind(&access_enc)
+        .bind(expires_at.to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        if let Some(enc) = &refresh_enc {
             let _ = sqlx::query("UPDATE caldav_sources SET refresh_token_enc = ? WHERE id = ?")
-                .bind(&enc)
-                .bind(source_id)
+                .bind(enc)
+                .bind(id)
                 .execute(pool)
                 .await;
         }
     }
 
-    tracing::info!(source_id = %source_id, "refreshed Basecamp access token");
+    tracing::info!(
+        source_id = %source_id,
+        sources_updated = siblings.len(),
+        rotated_refresh_token = refresh_enc.is_some(),
+        "refreshed Basecamp access token"
+    );
     Ok(token.access_token)
 }
 
@@ -298,6 +330,28 @@ pub async fn valid_access_token(
             refresh_access_token(pool, key, source_id).await
         }
     }
+}
+
+/// Every Basecamp source that shares this one's tokens: same calrs account and
+/// same authorizing identity (stored in `username`). Always includes
+/// `source_id` itself, so a caller can iterate the result unconditionally.
+async fn sibling_source_ids(pool: &SqlitePool, source_id: &str) -> Vec<String> {
+    let ids: Vec<(String,)> = sqlx::query_as(
+        "SELECT s.id FROM caldav_sources s
+         JOIN caldav_sources origin ON origin.id = ?
+         WHERE s.provider_type = 'basecamp'
+           AND s.account_id = origin.account_id
+           AND s.username = origin.username",
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if ids.is_empty() {
+        return vec![source_id.to_string()];
+    }
+    ids.into_iter().map(|(id,)| id).collect()
 }
 
 /// Is the stored expiry missing, past, or within the refresh buffer?
@@ -388,6 +442,69 @@ mod tests {
     #[test]
     fn identity_requires_the_identity_object() {
         assert!(parse_identity(&serde_json::json!({"accounts": []})).is_err());
+    }
+
+    async fn pool_with_sources() -> (sqlx::SqlitePool, String, String, String) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+
+        let account = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO accounts (id, name, email, timezone) VALUES (?, 'A', 'a@b.c', 'UTC')",
+        )
+        .bind(&account)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut ids = Vec::new();
+        // Two accounts from one login, plus one from a different identity.
+        for (account_number, identity) in [
+            ("111", "victor@x.test"),
+            ("222", "victor@x.test"),
+            ("333", "someone@else.test"),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO caldav_sources (id, account_id, name, url, username, provider_type, auth_type, oauth2_provider) \
+                 VALUES (?, ?, 'Basecamp', ?, ?, 'basecamp', 'oauth2', 'basecamp')",
+            )
+            .bind(&id)
+            .bind(&account)
+            .bind(super::super::account_url(account_number))
+            .bind(identity)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        (pool, ids[0].clone(), ids[1].clone(), ids[2].clone())
+    }
+
+    /// Launchpad tokens belong to the identity, so a rotation has to reach
+    /// every source created from the same login — otherwise the siblings keep
+    /// a refresh token the server has retired and break until reconnect.
+    #[tokio::test]
+    async fn siblings_span_one_login_and_stop_there() {
+        let (pool, first, second, other_identity) = pool_with_sources().await;
+
+        let mut siblings = sibling_source_ids(&pool, &first).await;
+        siblings.sort();
+        let mut expected = vec![first.clone(), second];
+        expected.sort();
+        assert_eq!(siblings, expected);
+        assert!(!siblings.contains(&other_identity));
+    }
+
+    /// A source id that matches nothing still yields itself, so callers can
+    /// iterate the result without a special case.
+    #[tokio::test]
+    async fn siblings_fall_back_to_the_source_itself() {
+        let (pool, _a, _b, _c) = pool_with_sources().await;
+        assert_eq!(
+            sibling_source_ids(&pool, "no-such-source").await,
+            vec!["no-such-source".to_string()]
+        );
     }
 
     #[test]

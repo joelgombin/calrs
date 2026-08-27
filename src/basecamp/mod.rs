@@ -36,9 +36,10 @@
 //!   only `status` and a page number, so `fetch_events_since` filters client
 //!   side. The response order is not documented (37signals' own CLI sorts
 //!   entries itself), so pagination does *not* stop early on a page that falls
-//!   outside the window — it walks to the end of the collection or to
-//!   [`MAX_ENTRY_PAGES`], whichever comes first, and logs when the cap
-//!   truncates coverage rather than reporting partial data as complete.
+//!   outside the window — it walks to the end of the collection (per the `Link`
+//!   header) or to [`MAX_ENTRY_PAGES`], whichever comes first. Hitting the cap
+//!   is reported as an *incomplete* [`EventSnapshot`], which is what stops sync
+//!   from mistaking the missing tail for deleted events.
 //! - **Recurring entries are read as single events.** Basecamp models
 //!   recurrence with a `recurrence_schedule` object rather than an RRULE, and
 //!   listings return the series head. Recurring Basecamp entries therefore
@@ -62,7 +63,7 @@ pub mod oauth;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 
-use crate::providers::{CalendarProvider, DeltaResult, RawEvent, RemoteCalendar};
+use crate::providers::{CalendarProvider, DeltaResult, EventSnapshot, RawEvent, RemoteCalendar};
 use client::BasecampClient;
 
 /// Default API host. Basecamp 3/4/5 all live under this origin; the account id
@@ -189,13 +190,9 @@ impl CalendarProvider for BasecampProvider {
 
     async fn list_calendars(&self) -> Result<Vec<RemoteCalendar>> {
         let mut out = Vec::new();
-        for page in 1..=MAX_PROJECT_PAGES {
-            let projects = self.client.get_projects_page(page).await?;
-            if projects.is_empty() {
-                break;
-            }
-            let count = projects.len();
-            for project in projects {
+        for page_number in 1..=MAX_PROJECT_PAGES {
+            let page = self.client.get_projects_page(page_number).await?;
+            for project in &page.items {
                 if let Some(schedule) = project.schedule_dock_id() {
                     out.push(RemoteCalendar {
                         id: calendar_id(project.id, schedule),
@@ -209,15 +206,19 @@ impl CalendarProvider for BasecampProvider {
                     });
                 }
             }
-            if count < client::PER_PAGE_HINT {
-                break;
+            if !page.has_next {
+                return Ok(out);
             }
         }
+        tracing::warn!(
+            pages = MAX_PROJECT_PAGES,
+            "Basecamp account has more projects than the page cap; later projects were not listed"
+        );
         Ok(out)
     }
 
     async fn fetch_events(&self, calendar_id: &str) -> Result<Vec<RawEvent>> {
-        self.fetch_entries(calendar_id, None).await
+        Ok(self.fetch_entries(calendar_id, None).await?.events)
     }
 
     async fn fetch_events_since(
@@ -225,6 +226,17 @@ impl CalendarProvider for BasecampProvider {
         calendar_id: &str,
         since_utc: &str,
     ) -> Result<Vec<RawEvent>> {
+        Ok(self
+            .fetch_snapshot_since(calendar_id, since_utc)
+            .await?
+            .events)
+    }
+
+    async fn fetch_snapshot_since(
+        &self,
+        calendar_id: &str,
+        since_utc: &str,
+    ) -> Result<EventSnapshot> {
         let since = chrono::DateTime::parse_from_rfc3339(since_utc)
             .map(|d| d.with_timezone(&chrono::Utc))
             .ok();
@@ -296,19 +308,18 @@ impl BasecampProvider {
         &self,
         calendar_id: &str,
         since: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<Vec<RawEvent>> {
+    ) -> Result<EventSnapshot> {
         let (project_id, schedule_id) = split_calendar_id(calendar_id)?;
-        let mut out = Vec::new();
-        let mut exhausted = false;
+        let mut events = Vec::new();
+        let mut complete = false;
 
-        for page in 1..=MAX_ENTRY_PAGES {
-            let entries = self
+        for page_number in 1..=MAX_ENTRY_PAGES {
+            let page = self
                 .client
-                .get_schedule_entries_page(project_id, schedule_id, page)
+                .get_schedule_entries_page(project_id, schedule_id, page_number)
                 .await?;
-            let count = entries.len();
 
-            for entry in entries {
+            for entry in &page.items {
                 if let Some(cutoff) = since {
                     // An unparseable start is kept rather than dropped: the
                     // iCal synth decides whether it is usable.
@@ -316,29 +327,32 @@ impl BasecampProvider {
                         continue;
                     }
                 }
-                if let Some(ics) = ical::synth_vcalendar(&entry) {
-                    out.push(RawEvent {
+                if let Some(ics) = ical::synth_vcalendar(entry) {
+                    events.push(RawEvent {
                         remote_id: entry.id.to_string(),
                         ical: ics,
                     });
                 }
             }
 
-            if count < client::PER_PAGE_HINT {
-                exhausted = true;
+            if !page.has_next {
+                complete = true;
                 break;
             }
         }
 
-        if !exhausted {
+        if !complete {
+            // Reported rather than logged-and-forgotten: the caller must not
+            // read the missing tail as "these events were deleted", which is
+            // what would cancel the bookings behind them.
             tracing::warn!(
                 calendar = %calendar_id,
                 pages = MAX_ENTRY_PAGES,
-                "Basecamp schedule has more entries than the page cap; later entries were not read this sync"
+                "Basecamp schedule has more entries than the page cap; snapshot is incomplete, stale events will not be reconciled"
             );
         }
 
-        Ok(out)
+        Ok(EventSnapshot { events, complete })
     }
 
     /// Resolve a calrs UID to a Basecamp schedule entry id.
@@ -357,18 +371,17 @@ impl BasecampProvider {
             return Ok(Some(id));
         }
 
-        for page in 1..=MAX_ENTRY_PAGES {
-            let entries = self
+        for page_number in 1..=MAX_ENTRY_PAGES {
+            let page = self
                 .client
-                .get_schedule_entries_page(project_id, schedule_id, page)
+                .get_schedule_entries_page(project_id, schedule_id, page_number)
                 .await?;
-            let count = entries.len();
-            for entry in &entries {
+            for entry in &page.items {
                 if ical::uid_marker_matches(entry.description.as_deref(), uid) {
                     return Ok(Some(entry.id));
                 }
             }
-            if count < client::PER_PAGE_HINT {
+            if !page.has_next {
                 return Ok(None);
             }
         }

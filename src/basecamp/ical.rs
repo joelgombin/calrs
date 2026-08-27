@@ -17,7 +17,8 @@
 //!   by parsing the UID — no lookup.
 //! - Entries calrs creates keep the booking's own UID, recorded in the entry
 //!   description as `[calrs-uid:…]`. That marker is what
-//!   [`uid_marker_matches`] scans for.
+//!   [`uid_marker_matches`] scans for; the entries listing carries
+//!   `description`, so the scan costs no per-entry fetch.
 //!
 //! The marker is deliberately plain visible text rather than an HTML comment:
 //! Basecamp sanitises rich text on the way in, and a comment it decides to
@@ -149,6 +150,11 @@ pub fn entry_payload_from_ics(uid: &str, ics: &str) -> Result<ScheduleEntryPaylo
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("No VEVENT in the ICS handed to the Basecamp provider"))?;
+    // A VALARM lives inside the VEVENT and carries its own
+    // `DESCRIPTION:Reminder`. Field extraction takes the first match, so on a
+    // booking with no notes that alarm text would become the entry's
+    // description — a Basecamp entry that just says "Reminder".
+    let vevent = strip_subcomponents(&vevent);
 
     let field = |name: &str| crate::utils::extract_vevent_field(&vevent, name);
 
@@ -197,6 +203,29 @@ pub fn entry_payload_from_ics(uid: &str, ics: &str) -> Result<ScheduleEntryPaylo
         all_day,
         notify: false,
     })
+}
+
+/// Drop nested components (VALARM today) from a VEVENT block, so property
+/// lookups only see the event's own fields.
+fn strip_subcomponents(vevent: &str) -> String {
+    let mut out = String::with_capacity(vevent.len());
+    let mut depth = 0usize;
+    for line in vevent.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("BEGIN:V") && !trimmed.eq_ignore_ascii_case("BEGIN:VEVENT") {
+            depth += 1;
+            continue;
+        }
+        if trimmed.starts_with("END:V") && !trimmed.eq_ignore_ascii_case("END:VEVENT") {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 0 {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Wrap text in a Basecamp rich-text paragraph, HTML-escaped.
@@ -487,6 +516,37 @@ mod tests {
         assert!(p.all_day);
         assert_eq!(p.starts_at, "2026-06-08");
         assert_eq!(p.ends_at, "2026-06-08");
+    }
+
+    /// Regression: the VALARM inside a VEVENT carries `DESCRIPTION:Reminder`,
+    /// which used to become the Basecamp entry's whole description whenever a
+    /// booking had no guest notes.
+    #[test]
+    fn payload_ignores_valarm_description() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u@calrs\r\n\
+            DTSTART:20260310T130000Z\r\nDTEND:20260310T133000Z\r\nSUMMARY:Intro\r\n\
+            BEGIN:VALARM\r\nTRIGGER:-PT30M\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\n\
+            END:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let p = entry_payload_from_ics("u@calrs", ics).unwrap();
+        let desc = p.description.unwrap();
+        assert!(!desc.contains("Reminder"), "{}", desc);
+        // Only the UID marker is left.
+        assert_eq!(desc, "<div>[calrs-uid:u@calrs]</div>");
+        assert_eq!(p.summary, "Intro");
+    }
+
+    /// The event's own DESCRIPTION still wins when a VALARM is also present.
+    #[test]
+    fn payload_keeps_event_description_alongside_a_valarm() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u@calrs\r\n\
+            DTSTART:20260310T130000Z\r\nDTEND:20260310T133000Z\r\nSUMMARY:Intro\r\n\
+            DESCRIPTION:Wants to discuss pricing\r\n\
+            BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nEND:VALARM\r\n\
+            END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let p = entry_payload_from_ics("u@calrs", ics).unwrap();
+        let desc = p.description.unwrap();
+        assert!(desc.contains("Wants to discuss pricing"), "{}", desc);
+        assert!(!desc.contains("Reminder"), "{}", desc);
     }
 
     #[test]

@@ -526,12 +526,47 @@ pub async fn sync_provider_source(
             upsert_calendar_provider(pool, source_id, cal_info).await?;
         let cal_label = cal_info.display_name.as_deref().unwrap_or(&cal_info.id);
 
-        match provider.fetch_events_since(&cal_info.id, &since_iso).await {
-            Ok(raw_events) => {
-                let count = upsert_provider_events(pool, &cal_id, &raw_events).await;
-                let deleted =
-                    remove_orphaned_provider_events(pool, key, &cal_id, &raw_events, &since_prefix)
-                        .await;
+        // A calendar the host marked non-busy blocks nothing, and nothing else
+        // reads its cached events, so there is no reason to pay for the fetch.
+        // On a Basecamp account with many projects this is the difference
+        // between a slot page syncing a handful of schedules and all of them.
+        if !calendar_is_busy(pool, &cal_id).await {
+            println!(
+                "  {} {} — skipped (not a busy calendar)",
+                "·".dimmed(),
+                cal_label
+            );
+            continue;
+        }
+
+        match provider
+            .fetch_snapshot_since(&cal_info.id, &since_iso)
+            .await
+        {
+            Ok(snapshot) => {
+                let count = upsert_provider_events(pool, &cal_id, &snapshot.events).await;
+                // Orphan reconciliation deletes local events missing from the
+                // response *and cancels the bookings behind them*, so it may
+                // only run against a snapshot the provider vouches for as
+                // complete. A capped Basecamp walk keeps its cache instead —
+                // a stale busy interval is recoverable, a wrongly cancelled
+                // booking is not.
+                let deleted = if snapshot.complete {
+                    remove_orphaned_provider_events(
+                        pool,
+                        key,
+                        &cal_id,
+                        &snapshot.events,
+                        &since_prefix,
+                    )
+                    .await
+                } else {
+                    tracing::warn!(
+                        calendar_name = cal_label,
+                        "skipping stale-event reconciliation: provider reported an incomplete snapshot"
+                    );
+                    0
+                };
                 if deleted > 0 {
                     tracing::info!(
                         calendar_name = cal_label,
@@ -540,7 +575,7 @@ pub async fn sync_provider_source(
                     );
                 }
                 println!(
-                    "  {} {} — {} event(s) synced{}",
+                    "  {} {} — {} event(s) synced{}{}",
                     "✓".green(),
                     cal_label,
                     count,
@@ -548,7 +583,8 @@ pub async fn sync_provider_source(
                         format!(", {} removed", deleted)
                     } else {
                         String::new()
-                    }
+                    },
+                    if snapshot.complete { "" } else { " (partial)" }
                 );
             }
             Err(e) => {
@@ -567,6 +603,18 @@ pub async fn sync_provider_source(
         .await?;
     tracing::info!(source_id = %source_id, "provider sync completed");
     Ok(())
+}
+
+/// Is this calendar one whose events block availability? Newly discovered
+/// calendars default to busy, so this only skips what the host untick(ed).
+async fn calendar_is_busy(pool: &SqlitePool, cal_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT is_busy FROM calendars WHERE id = ?")
+        .bind(cal_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 /// Provider-trait equivalent of [`upsert_calendar`]. The `href` column holds

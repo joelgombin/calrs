@@ -10,9 +10,11 @@
 //!   one carrying an app name and a contact, so [`user_agent`] always sends
 //!   both.
 //! - **Pagination is server-driven.** Collections advertise the next page via
-//!   the RFC 5988 `Link` header. We ask for explicit `page=N` (the header's URL
-//!   is followed in spirit, not verbatim) and stop as soon as a short page
-//!   arrives, which is the documented end-of-collection signal.
+//!   the RFC 5988 `Link` header, and that header — not the number of items on
+//!   the page — is what says whether more exist. We request explicit `page=N`
+//!   rather than following the URL verbatim, but the stop condition is the
+//!   absence of `rel="next"`, so a short non-final page cannot truncate a
+//!   listing.
 //! - **429 means wait.** One retry honouring `Retry-After` covers the burst
 //!   limit; a second 429 is surfaced so the caller backs off instead of
 //!   hammering a throttled account.
@@ -21,10 +23,6 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Page size Basecamp uses for the collections this module reads. Used only to
-/// decide "was that the last page?", never sent to the server.
-pub const PER_PAGE_HINT: usize = 15;
-
 /// Timeout for a single API call. Basecamp is fast; a long hang is a dead
 /// connection, and slot pages sync on demand so they must not block on it.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -32,6 +30,14 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Cap on a `Retry-After` we are willing to sleep through inline. Longer waits
 /// are turned into an error so an on-demand sync fails fast.
 const MAX_RETRY_AFTER_SECS: u64 = 5;
+
+/// One page of a collection, plus whether the server advertised another.
+#[derive(Debug, Clone)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// True when the response's `Link` header carries `rel="next"`.
+    pub has_next: bool,
+}
 
 /// One entry in a project's dock (the project's enabled tools).
 #[derive(Debug, Clone, Deserialize)]
@@ -160,9 +166,9 @@ impl BasecampClient {
     }
 
     /// One page of the account's active projects.
-    pub async fn get_projects_page(&self, page: u32) -> Result<Vec<Project>> {
+    pub async fn get_projects_page(&self, page: u32) -> Result<Page<Project>> {
         let url = format!("{}?page={}", self.url("projects.json"), page);
-        self.get_json(&url).await
+        self.get_page(&url).await
     }
 
     /// One page of a schedule's active entries.
@@ -176,7 +182,7 @@ impl BasecampClient {
         project_id: i64,
         schedule_id: i64,
         page: u32,
-    ) -> Result<Vec<ScheduleEntry>> {
+    ) -> Result<Page<ScheduleEntry>> {
         let url = format!(
             "{}?page={}",
             self.url(&format!(
@@ -185,7 +191,7 @@ impl BasecampClient {
             )),
             page
         );
-        self.get_json(&url).await
+        self.get_page(&url).await
     }
 
     /// Create a schedule entry, returning its id.
@@ -237,9 +243,15 @@ impl BasecampClient {
         Ok(())
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+    /// GET one page of a collection, reading the continuation signal from the
+    /// response's `Link` header before the body is consumed.
+    async fn get_page<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<Page<T>> {
         let resp = self.execute(reqwest::Method::GET, url, None).await?;
-        self.decode(resp).await
+        let has_next = has_next_page(resp.headers());
+        Ok(Page {
+            items: self.decode(resp).await?,
+            has_next,
+        })
     }
 
     async fn send_json<T: serde::de::DeserializeOwned, B: Serialize>(
@@ -325,6 +337,25 @@ pub fn user_agent() -> String {
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "https://github.com/joelgombin/calrs".to_string());
     format!("calrs/{} ({})", env!("CARGO_PKG_VERSION"), contact)
+}
+
+/// Does this response advertise a next page? RFC 5988 `Link` header, as the
+/// Basecamp docs instruct ("please don't build the pagination URLs yourself").
+///
+/// A response with no `Link` header at all is the last page — which is also
+/// how a single-page collection answers.
+fn has_next_page(headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(link) = headers
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    link.split(',').any(|part| {
+        part.split(';')
+            .skip(1)
+            .any(|param| param.trim().replace(['"', '\''], "") == "rel=next")
+    })
 }
 
 /// Read `Retry-After` (delay-seconds form) from a 429 response.
@@ -428,7 +459,10 @@ mod tests {
 
     #[test]
     fn schedule_entry_tolerates_missing_optional_fields() {
-        // Listings omit `description`; a stricter struct would fail the whole page.
+        // The entries listing does carry `description` (it is in 37signals'
+        // own response fixture), which is what makes the UID marker findable
+        // without a per-entry GET. Every field is still optional here so one
+        // odd entry cannot fail the whole page.
         let e: ScheduleEntry = serde_json::from_str(r#"{"id": 3}"#).unwrap();
         assert!(e.description.is_none());
         assert!(!e.all_day);
@@ -448,6 +482,38 @@ mod tests {
         assert!(!json.contains("description"), "json: {}", json);
         assert!(json.contains("\"starts_at\":\"2026-03-10T13:00:00Z\""));
         assert!(json.contains("\"notify\":false"));
+    }
+
+    fn link_headers(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::LINK, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn detects_next_page_from_link_header() {
+        assert!(has_next_page(&link_headers(
+            "<https://3.basecampapi.com/1/projects.json?page=2>; rel=\"next\""
+        )));
+        // Quoting and spacing vary between servers and proxies.
+        assert!(has_next_page(&link_headers(
+            "<https://x/y?page=3>;rel=next"
+        )));
+        assert!(has_next_page(&link_headers(
+            "<https://x/y?page=1>; rel=\"prev\", <https://x/y?page=3>; rel=\"next\""
+        )));
+    }
+
+    #[test]
+    fn last_page_has_no_next() {
+        assert!(!has_next_page(&reqwest::header::HeaderMap::new()));
+        assert!(!has_next_page(&link_headers(
+            "<https://x/y?page=1>; rel=\"prev\""
+        )));
+        // `rel="nextish"` is not `rel="next"`.
+        assert!(!has_next_page(&link_headers(
+            "<https://x/y>; rel=\"nextish\""
+        )));
     }
 
     #[test]

@@ -127,10 +127,13 @@ to notify anyone. That keeps a booking from double-notifying the host.
 - **No delta sync.** The API has no "changed since" cursor for schedule
   entries and no date filter, so every sync is a bounded full fetch of each
   project's entries (the same shape as the Exchange/EWS connector). Syncs are
-  still cheap: a booking page only re-syncs a source older than five minutes.
-  Coverage is capped at 20 pages per project (~300 entries); a project that
-  exceeds it logs `more entries than the page cap` rather than reporting
-  partial data as complete.
+  still cheap: a booking page only re-syncs a source older than five minutes,
+  and only calendars left marked *busy* are fetched at all — untick the
+  projects you do not schedule around and they stop costing anything.
+  Coverage is capped at 20 pages per project (~300 entries). Past that, the
+  sync keeps what it read but stops reconciling deletions for that project
+  (logged as `snapshot is incomplete`), because treating the unread tail as
+  "these events were deleted" would cancel the bookings behind them.
 - **Recurring Basecamp entries block only their first occurrence.** Basecamp
   models recurrence with its own `recurrence_schedule` object rather than an
   iCalendar `RRULE`, and listings return the series head. Translating that
