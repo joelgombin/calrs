@@ -15,8 +15,10 @@ use async_trait::async_trait;
 
 pub mod caldav;
 pub mod factory;
+pub mod source;
 
 pub use factory::build_provider;
+pub use source::{build_for_source, SourceCredentials};
 
 /// A calendar discovered on a remote provider.
 ///
@@ -45,6 +47,19 @@ pub struct RemoteCalendar {
 pub struct RawEvent {
     pub remote_id: String,
     pub ical: String,
+}
+
+/// A full-fetch snapshot of a calendar.
+///
+/// `complete` is what makes orphan reconciliation safe: callers delete local
+/// events that are absent from a snapshot (and cancel the bookings behind
+/// them), which is only sound when the snapshot really is every event in the
+/// window. A provider that had to bound its own pagination reports
+/// `complete = false` so the caller keeps its cache instead.
+#[derive(Debug, Clone)]
+pub struct EventSnapshot {
+    pub events: Vec<RawEvent>,
+    pub complete: bool,
 }
 
 /// Outcome of a delta sync (incremental fetch).
@@ -80,6 +95,21 @@ pub trait CalendarProvider: Send + Sync {
     /// Implementations that can't filter by time fall back to `fetch_events`.
     async fn fetch_events_since(&self, calendar_id: &str, since_utc: &str)
         -> Result<Vec<RawEvent>>;
+
+    /// Fetch events from `since_utc` as a snapshot that says whether it is
+    /// complete. Defaults to `fetch_events_since` marked complete, which is
+    /// right for any provider whose fetch is bounded by the server rather than
+    /// by the client.
+    async fn fetch_snapshot_since(
+        &self,
+        calendar_id: &str,
+        since_utc: &str,
+    ) -> Result<EventSnapshot> {
+        Ok(EventSnapshot {
+            events: self.fetch_events_since(calendar_id, since_utc).await?,
+            complete: true,
+        })
+    }
 
     /// Incremental sync from a previous sync state.
     ///

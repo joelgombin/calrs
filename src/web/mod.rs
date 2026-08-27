@@ -1360,6 +1360,11 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .route("/dashboard/sources/{id}/test", post(test_source))
         .route("/dashboard/sources/google/connect", get(google_connect))
         .route("/dashboard/sources/google/callback", get(google_callback))
+        .route("/dashboard/sources/basecamp/connect", get(basecamp_connect))
+        .route(
+            "/dashboard/sources/basecamp/callback",
+            get(basecamp_callback),
+        )
         .route("/dashboard/sources/{id}/sync", post(sync_source))
         .route(
             "/dashboard/sources/{id}/force-sync",
@@ -1420,6 +1425,10 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .route(
             "/dashboard/admin/google-oauth2",
             post(admin_update_google_oauth2),
+        )
+        .route(
+            "/dashboard/admin/basecamp-oauth2",
+            post(admin_update_basecamp_oauth2),
         )
         .route("/dashboard/admin/captcha", post(admin_update_captcha))
         .route("/dashboard/admin/resources", post(admin_create_resource))
@@ -4593,6 +4602,139 @@ async fn confirm_booking(
 
 // --- Event type CRUD ---
 
+/// Calendars whose events can block an event type's slots, for the
+/// conflict-calendar checkboxes. Only `is_busy` calendars: an untick(ed) one
+/// blocks nothing, so offering it would promise something it cannot do.
+async fn conflict_calendars_ctx(pool: &SqlitePool, user_id: &str) -> Vec<minijinja::Value> {
+    let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT c.id, c.display_name, cs.name FROM calendars c
+         JOIN caldav_sources cs ON cs.id = c.source_id
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE a.user_id = ? AND c.is_busy = 1
+         ORDER BY cs.name, c.display_name",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|(id, display_name, source_name)| {
+            context! {
+                id => id,
+                name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
+            }
+        })
+        .collect()
+}
+
+/// Calendars a host can write bookings into, for the event-type picker.
+///
+/// Unlike the conflict-calendar list this is not filtered on `is_busy`: a
+/// calendar can be a write target without blocking availability (a Basecamp
+/// project schedule the team books into, say). Labels carry the source name so
+/// two projects called "Sales" on different accounts stay distinguishable.
+async fn writable_calendars_ctx(pool: &SqlitePool, user_id: &str) -> Vec<minijinja::Value> {
+    let rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.display_name, cs.name, cs.provider_type FROM calendars c
+         JOIN caldav_sources cs ON cs.id = c.source_id
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE a.user_id = ? AND cs.enabled = 1
+         ORDER BY cs.name, c.display_name",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.iter()
+        .map(|(id, display_name, source_name, provider_type)| {
+            context! {
+                id => id,
+                name => format!(
+                    "{} — {} ({})",
+                    source_name,
+                    display_name.as_deref().unwrap_or("Unnamed"),
+                    crate::providers::factory::label(provider_type),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Persist an event type's pinned write calendar.
+///
+/// Only a calendar the editing user owns can be set — the picker lists exactly
+/// those, and accepting anything else would let one host aim another's calendar.
+/// A blank submission clears the pin, *unless* the stored pin points at a
+/// calendar this user cannot see: a team-mate's (or an admin's) choice must not
+/// be silently dropped by whoever edits the event type next.
+async fn save_event_type_write_calendar(
+    pool: &SqlitePool,
+    event_type_id: &str,
+    user_id: &str,
+    submitted: Option<&str>,
+) {
+    let submitted = submitted.map(str::trim).filter(|s| !s.is_empty());
+
+    let resolved: Option<String> = match submitted {
+        Some(cal_id) => {
+            let owned: Option<(String,)> = sqlx::query_as(
+                "SELECT c.id FROM calendars c
+                 JOIN caldav_sources cs ON cs.id = c.source_id
+                 JOIN accounts a ON a.id = cs.account_id
+                 WHERE c.id = ? AND a.user_id = ?",
+            )
+            .bind(cal_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+            match owned {
+                Some((id,)) => Some(id),
+                None => {
+                    tracing::warn!(event_type_id = %event_type_id, user_id = %user_id, calendar_id = %cal_id, "ignored write calendar the user does not own");
+                    return;
+                }
+            }
+        }
+        None => {
+            let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT write_calendar_id FROM event_types WHERE id = ?",
+            )
+            .bind(event_type_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None)
+            .flatten();
+            if let Some(stored_id) = stored {
+                let visible: Option<(String,)> = sqlx::query_as(
+                    "SELECT c.id FROM calendars c
+                     JOIN caldav_sources cs ON cs.id = c.source_id
+                     JOIN accounts a ON a.id = cs.account_id
+                     WHERE c.id = ? AND a.user_id = ?",
+                )
+                .bind(&stored_id)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+                if visible.is_none() {
+                    // Not this user's to clear.
+                    return;
+                }
+            }
+            None
+        }
+    };
+
+    let _ = sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+        .bind(&resolved)
+        .bind(event_type_id)
+        .execute(pool)
+        .await;
+}
+
 #[derive(Deserialize)]
 struct EventTypeForm {
     _csrf: Option<String>,
@@ -4629,6 +4771,9 @@ struct EventTypeForm {
     team_id: Option<String>,
     // Calendar selection (comma-separated IDs)
     calendar_ids: Option<String>,
+    // Calendar confirmed bookings are written to, overriding the source
+    // default. Empty = use the source default.
+    write_calendar_id: Option<String>,
     resource_ids: Option<String>,
     resource_scheduling_mode: Option<String>,
     // Reminder
@@ -4900,26 +5045,8 @@ async fn new_event_type_form(
         groups_ctx.push(context! { id => id, name => name, members => members_ctx });
     }
 
-    // Get user's calendars (is_busy=1) for calendar selection
-    let calendars: Vec<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT c.id, c.display_name, cs.name FROM calendars c
-         JOIN caldav_sources cs ON cs.id = c.source_id
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE a.user_id = ? AND c.is_busy = 1
-         ORDER BY cs.name, c.display_name",
-    )
-    .bind(&user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let calendars_ctx: Vec<minijinja::Value> = calendars
-        .iter()
-        .map(|(id, display_name, source_name)| context! {
-            id => id,
-            name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
-        })
-        .collect();
+    // Calendars whose events can block this event type's slots.
+    let calendars_ctx = conflict_calendars_ctx(&state.pool, &user.id).await;
 
     // Pre-fill availability from user's default schedule
     ensure_user_avail_seeded(&state.pool, &user.id).await;
@@ -4948,6 +5075,8 @@ async fn new_event_type_form(
             teams => groups_ctx,
             calendars => calendars_ctx,
             selected_calendar_ids => "",
+            write_calendars => writable_calendars_ctx(&state.pool, &user.id).await,
+            form_write_calendar_id => "",
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
             can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
@@ -5039,6 +5168,7 @@ async fn create_event_type(
             "Title is required to generate a slug.",
             &form,
             false,
+            false,
         )
         .await
         .into_response();
@@ -5073,6 +5203,7 @@ async fn create_event_type(
             "An event type with this slug already exists.",
             &form,
             false,
+            false,
         )
         .await
         .into_response();
@@ -5100,6 +5231,7 @@ async fn create_event_type(
             "Location details are required (e.g. a video call link, phone number, or address).",
             &form,
             false,
+            false,
         )
         .await
         .into_response();
@@ -5114,6 +5246,7 @@ async fn create_event_type(
                 &auth_user,
                 "You are not a team admin of this team.",
                 &form,
+                false,
                 false,
             )
             .await
@@ -5236,6 +5369,14 @@ async fn create_event_type(
         }
     }
 
+    save_event_type_write_calendar(
+        &state.pool,
+        &et_id,
+        &auth_user.user.id,
+        form.write_calendar_id.as_deref(),
+    )
+    .await;
+
     // Save member priorities (creation flow: "uid1:3,uid2:1,uid3:2")
     // Only insert weights for users who are actually team members.
     if let Some(tid) = team_id {
@@ -5348,6 +5489,16 @@ async fn edit_event_type_form(
             .await
             .unwrap_or(0);
 
+    // Pinned write calendar (NULL = use each source's default write calendar).
+    let write_calendar_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT write_calendar_id FROM event_types WHERE id = ?",
+    )
+    .bind(&et_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None)
+    .flatten();
+
     let form_timezone: String =
         sqlx::query_scalar::<_, Option<String>>("SELECT timezone FROM event_types WHERE id = ?")
             .bind(&et_id)
@@ -5436,26 +5587,8 @@ async fn edit_event_type_form(
     // Build per-day schedule string
     let avail_schedule = build_avail_schedule(&all_rules);
 
-    // Get user's calendars (is_busy=1) for calendar selection
-    let calendars: Vec<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT c.id, c.display_name, cs.name FROM calendars c
-         JOIN caldav_sources cs ON cs.id = c.source_id
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE a.user_id = ? AND c.is_busy = 1
-         ORDER BY cs.name, c.display_name",
-    )
-    .bind(&user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let calendars_ctx: Vec<minijinja::Value> = calendars
-        .iter()
-        .map(|(id, display_name, source_name)| context! {
-            id => id,
-            name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
-        })
-        .collect();
+    // Calendars whose events can block this event type's slots.
+    let calendars_ctx = conflict_calendars_ctx(&state.pool, &user.id).await;
 
     // Get currently selected calendars for this event type
     let selected_cals: Vec<(String,)> =
@@ -5584,6 +5717,8 @@ async fn edit_event_type_form(
             original_slug => et_slug,
             calendars => calendars_ctx,
             selected_calendar_ids => selected_calendar_ids,
+            write_calendars => writable_calendars_ctx(&state.pool, &user.id).await,
+            form_write_calendar_id => write_calendar_id.clone().unwrap_or_default(),
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
             can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
@@ -5706,6 +5841,7 @@ async fn update_event_type(
                 "An event type with this slug already exists.",
                 &form,
                 true,
+                false,
             )
             .await
             .into_response();
@@ -5729,6 +5865,7 @@ async fn update_event_type(
             "Location details are required (e.g. a video call link, phone number, or address).",
             &form,
             true,
+            false,
         )
         .await
         .into_response();
@@ -5847,6 +5984,14 @@ async fn update_event_type(
             }
         }
     }
+
+    save_event_type_write_calendar(
+        &state.pool,
+        &et_id,
+        &auth_user.user.id,
+        form.write_calendar_id.as_deref(),
+    )
+    .await;
 
     // Update booking frequency limits: delete old, insert new
     let _ = sqlx::query("DELETE FROM booking_frequency_limits WHERE event_type_id = ?")
@@ -6126,6 +6271,7 @@ fn parse_provider_type(raw: Option<&str>) -> Result<String, String> {
     match value {
         crate::providers::factory::kinds::CALDAV => Ok("caldav".to_string()),
         crate::providers::factory::kinds::EWS => Ok("ews".to_string()),
+        crate::providers::factory::kinds::BASECAMP => Ok("basecamp".to_string()),
         other => Err(format!("Unknown provider type '{}'", other)),
     }
 }
@@ -6175,8 +6321,34 @@ fn caldav_providers() -> Vec<(&'static str, &'static str, &'static str, &'static
             "https://mail.example.com/EWS/Exchange.asmx",
             "ews",
         ),
+        ("basecamp", "Basecamp", "", "basecamp"),
         ("other", "Other / Generic CalDAV", "", "caldav"),
     ]
+}
+
+/// Which OAuth-only calendar back-ends an admin has configured, as
+/// `(google, basecamp)`. Both source-form renderers need it to decide between
+/// showing a connect button and explaining that nobody set the app up yet.
+///
+/// Basecamp counts as configured only with *both* halves of the app
+/// credentials: a live Connect button backed by a missing client secret sends
+/// the user through the 37signals consent screen and fails on the exchange,
+/// after the authorization code has already been spent.
+async fn oauth_providers_configured(pool: &SqlitePool) -> (bool, bool) {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT google_oauth2_client_id, basecamp_oauth2_client_id, basecamp_oauth2_client_secret FROM auth_config LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    let present = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
+    match row {
+        Some((google, basecamp_id, basecamp_secret)) => (
+            present(&google),
+            present(&basecamp_id) && present(&basecamp_secret),
+        ),
+        None => (false, false),
+    }
 }
 
 async fn new_source_form(
@@ -6193,15 +6365,7 @@ async fn new_source_form(
         .map(|(id, name, url, backend)| context! { id => id, name => name, url => url, backend => backend })
         .collect();
 
-    let google_configured: bool = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT google_oauth2_client_id FROM auth_config LIMIT 1",
-    )
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None)
-    .flatten()
-    .map(|s| !s.is_empty())
-    .unwrap_or(false);
+    let (google_configured, basecamp_configured) = oauth_providers_configured(&state.pool).await;
 
     let (impersonating, impersonating_name, _) = impersonation_ctx(&auth_user);
     Html(
@@ -6214,6 +6378,7 @@ async fn new_source_form(
             form_username => "",
             error => "",
             google_oauth2_configured => google_configured,
+            basecamp_oauth2_configured => basecamp_configured,
             sidebar => sidebar_context(&auth_user, "sources"),
             impersonating => impersonating,
             impersonating_name => impersonating_name,
@@ -6249,9 +6414,28 @@ async fn create_source(
                 "No scheduling account found. Please contact an administrator.",
                 &form,
             )
+            .await
             .into_response()
         }
     };
+
+    // Basecamp has no app passwords, so there is nothing this form could
+    // submit: sources are created by the OAuth flow. Say so rather than
+    // failing on the empty-credential check below.
+    if form
+        .provider_type
+        .as_deref()
+        .is_some_and(crate::providers::factory::is_oauth2_only)
+    {
+        return render_source_form_error(
+            &state,
+            &auth_user,
+            "Basecamp connects over OAuth. Use the \"Connect with Basecamp\" button instead of filling in credentials.",
+            &form,
+        )
+        .await
+        .into_response();
+    }
 
     let url = form.url.trim().to_string();
     let username = form.username.trim().to_string();
@@ -6259,20 +6443,25 @@ async fn create_source(
 
     if url.is_empty() || username.is_empty() || name.is_empty() || form.password.is_empty() {
         return render_source_form_error(&state, &auth_user, "All fields are required.", &form)
+            .await
             .into_response();
     }
 
     let provider_type = match parse_provider_type(form.provider_type.as_deref()) {
         Ok(p) => p,
         Err(msg) => {
-            return render_source_form_error(&state, &auth_user, &msg, &form).into_response();
+            return render_source_form_error(&state, &auth_user, &msg, &form)
+                .await
+                .into_response();
         }
     };
 
     // Validate URL against SSRF (HTTPS-only, no private targets) for both
     // CalDAV and EWS — the validator is shared.
     if let Err(e) = crate::providers::factory::validate_url(&provider_type, &url) {
-        return render_source_form_error(&state, &auth_user, &e.to_string(), &form).into_response();
+        return render_source_form_error(&state, &auth_user, &e.to_string(), &form)
+            .await
+            .into_response();
     }
 
     // Test connection unless skip requested
@@ -6284,6 +6473,7 @@ async fn create_source(
                 Ok(c) => c,
                 Err(e) => {
                     return render_source_form_error(&state, &auth_user, &e.to_string(), &form)
+                        .await
                         .into_response();
                 }
             };
@@ -6291,7 +6481,9 @@ async fn create_source(
             Ok(_) => {} // fine, even if features not explicitly advertised
             Err(e) => {
                 let msg = format!("Connection failed: {}. Check the URL and credentials, or check \"Skip connection test\" to save anyway.", e);
-                return render_source_form_error(&state, &auth_user, &msg, &form).into_response();
+                return render_source_form_error(&state, &auth_user, &msg, &form)
+                    .await
+                    .into_response();
             }
         }
     }
@@ -6343,7 +6535,7 @@ async fn create_source(
     Redirect::to("/dashboard/sources").into_response()
 }
 
-fn render_source_form_error(
+async fn render_source_form_error(
     state: &AppState,
     auth_user: &crate::auth::AuthUser,
     error: &str,
@@ -6359,6 +6551,10 @@ fn render_source_form_error(
         .map(|(id, name, url, backend)| context! { id => id, name => name, url => url, backend => backend })
         .collect();
 
+    // Re-rendering after an error must keep the connect buttons available:
+    // an OAuth-only back-end has no credentials to correct in the form.
+    let (google_configured, basecamp_configured) = oauth_providers_configured(&state.pool).await;
+
     let (impersonating, impersonating_name, _) = impersonation_ctx(auth_user);
     Html(
         tmpl.render(context! {
@@ -6369,6 +6565,8 @@ fn render_source_form_error(
             form_url => form.url.as_str(),
             form_username => form.username.as_str(),
             error => error,
+            google_oauth2_configured => google_configured,
+            basecamp_oauth2_configured => basecamp_configured,
             sidebar => sidebar_context(auth_user, "sources"),
             impersonating => impersonating,
             impersonating_name => impersonating_name,
@@ -6658,22 +6856,27 @@ async fn test_source(
 
     let label = crate::providers::factory::label(&provider_type);
 
-    // EWS sources go through the provider trait; CalDAV (basic or OAuth2) keeps
-    // the existing CaldavClient path so OAuth2 refresh + ctag stay intact.
-    let result = if provider_type == crate::providers::factory::kinds::EWS {
-        let password = match password_enc.as_deref() {
-            Some(enc) => match crate::crypto::decrypt_password(&state.secret_key, enc) {
-                Ok(p) => p,
-                Err(_) => {
-                    return Html("Failed to decrypt stored credentials.".to_string())
-                        .into_response()
-                }
-            },
-            None => {
-                return Html("Source has no stored password.".to_string()).into_response();
-            }
+    // Non-CalDAV back-ends go through the provider trait; CalDAV (basic or
+    // OAuth2) keeps the existing CaldavClient path so OAuth2 refresh + ctag
+    // stay intact.
+    let result = if crate::providers::factory::uses_generic_provider(&provider_type) {
+        let creds = crate::providers::SourceCredentials {
+            provider_type: &provider_type,
+            url: &url,
+            username: &username,
+            auth_type: &auth_type,
+            password_enc: password_enc.as_deref(),
+            access_token_enc: access_token_enc.as_deref(),
+            token_expires_at: token_expires_at.as_deref(),
         };
-        match crate::providers::build_provider(&provider_type, &url, &username, &password) {
+        match crate::providers::build_for_source(
+            &state.pool,
+            &state.secret_key,
+            &source_id,
+            &creds,
+        )
+        .await
+        {
             Ok(client) => match client.check_connection().await {
                 Ok(true) => format!("'{}' — connection OK ({}).", name, label),
                 Ok(false) => format!(
@@ -6750,26 +6953,25 @@ async fn run_sync_for_source(
     token_expires_at: Option<&str>,
     provider_type: &str,
 ) -> (Vec<String>, usize) {
-    // EWS sources go through the provider trait — no OAuth2 dispatch needed.
-    if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc {
-            Some(e) => e,
-            None => return (vec!["EWS source missing password".to_string()], 0),
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(e) => return (vec![format!("Decrypt failed: {}", e)], 0),
-        };
-        return run_sync(
-            pool,
-            key,
-            source_id,
+    // Non-CalDAV back-ends go through the provider trait. Credential
+    // resolution (password decryption for EWS, OAuth 2 refresh for Basecamp)
+    // happens in one place: providers::build_for_source.
+    if crate::providers::factory::uses_generic_provider(provider_type) {
+        let creds = crate::providers::SourceCredentials {
             provider_type,
             url,
             username,
-            &password,
-        )
-        .await;
+            auth_type,
+            password_enc,
+            access_token_enc,
+            token_expires_at,
+        };
+        let provider = match crate::providers::build_for_source(pool, key, source_id, &creds).await
+        {
+            Ok(p) => p,
+            Err(e) => return (vec![format!("Could not build provider: {}", e)], 0),
+        };
+        return sync_with_provider(pool, key, source_id, provider.as_ref()).await;
     }
     let client = match crate::oauth2_caldav::build_client_for_source(
         pool,
@@ -6802,9 +7004,10 @@ async fn run_sync_for_source(
     }
 }
 
-/// Run discovery + sync for a freshly-created source with plaintext password.
-/// Dispatches on `provider_type`: EWS goes through the trait-based path,
-/// CalDAV reuses the existing `CaldavClient` + `sync_source` flow.
+/// Run discovery + sync for a freshly-created source with a plaintext secret.
+/// Dispatches on `provider_type`: trait-based back-ends go through
+/// [`sync_with_provider`], CalDAV reuses the existing `CaldavClient` +
+/// `sync_source` flow.
 async fn run_sync(
     pool: &SqlitePool,
     key: &[u8; 32],
@@ -6814,40 +7017,48 @@ async fn run_sync(
     username: &str,
     password: &str,
 ) -> (Vec<String>, usize) {
-    if provider_type == crate::providers::factory::kinds::EWS {
+    if crate::providers::factory::uses_generic_provider(provider_type) {
         let provider =
             match crate::providers::build_provider(provider_type, url, username, password) {
                 Ok(p) => p,
                 Err(e) => return (vec![format!("Could not build provider: {}", e)], 0),
             };
-        match crate::commands::sync::sync_ews_source(pool, key, provider.as_ref(), source_id).await
-        {
-            Ok(()) => {
-                let cal_count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
-                        .bind(source_id)
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
-                (vec!["Sync complete.".to_string()], cal_count as usize)
-            }
-            Err(e) => (vec![format!("Sync failed: {}", e)], 0),
-        }
-    } else {
-        let client = crate::caldav::CaldavClient::new(url, username, password);
-        match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
-            Ok(()) => {
-                let cal_count: i64 =
-                    sqlx::query_scalar("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
-                        .bind(source_id)
-                        .fetch_one(pool)
-                        .await
-                        .unwrap_or(0);
-                (vec!["Sync complete.".to_string()], cal_count as usize)
-            }
-            Err(e) => (vec![format!("Sync failed: {}", e)], 0),
-        }
+        return sync_with_provider(pool, key, source_id, provider.as_ref()).await;
     }
+
+    let client = crate::caldav::CaldavClient::new(url, username, password);
+    match crate::commands::sync::sync_source(pool, key, &client, source_id).await {
+        Ok(()) => (
+            vec!["Sync complete.".to_string()],
+            calendar_count(pool, source_id).await,
+        ),
+        Err(e) => (vec![format!("Sync failed: {}", e)], 0),
+    }
+}
+
+/// Sync one source through the provider trait and report the outcome the way
+/// the dashboard expects: a message list plus how many calendars are known.
+async fn sync_with_provider(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    source_id: &str,
+    provider: &dyn crate::providers::CalendarProvider,
+) -> (Vec<String>, usize) {
+    match crate::commands::sync::sync_provider_source(pool, key, provider, source_id).await {
+        Ok(()) => (
+            vec!["Sync complete.".to_string()],
+            calendar_count(pool, source_id).await,
+        ),
+        Err(e) => (vec![format!("Sync failed: {}", e)], 0),
+    }
+}
+
+async fn calendar_count(pool: &SqlitePool, source_id: &str) -> usize {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM calendars WHERE source_id = ?")
+        .bind(source_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0) as usize
 }
 
 async fn force_sync_source(
@@ -7176,6 +7387,7 @@ async fn render_event_type_form_error(
     error: &str,
     form: &EventTypeForm,
     editing: bool,
+    is_group: bool,
 ) -> Html<String> {
     let tmpl = match state.templates.get_template("event_type_form.html") {
         Ok(t) => t,
@@ -7195,10 +7407,29 @@ async fn render_event_type_form_error(
         .map(|(id, name)| context! { id => id, name => name })
         .collect();
 
+    // Same reasoning as the resources block above: omitting a list hides its
+    // control, and the resubmit then silently drops what the user had chosen.
+    // Both echo what was submitted rather than what is stored.
+    //
+    // Conflict calendars only for personal event types: the team form has no
+    // such section, and rendering one here would show a control whose value the
+    // team handlers discard.
+    let calendars_ctx = if is_group {
+        Vec::new()
+    } else {
+        conflict_calendars_ctx(&state.pool, &auth_user.user.id).await
+    };
+    let write_calendars = writable_calendars_ctx(&state.pool, &auth_user.user.id).await;
+
     let (impersonating, impersonating_name, _) = impersonation_ctx(auth_user);
     Html(
         tmpl.render(context! {
             resources_all => resources_all,
+            is_group => is_group,
+            calendars => calendars_ctx,
+            selected_calendar_ids => form.calendar_ids.clone().unwrap_or_default(),
+            write_calendars => write_calendars,
+            form_write_calendar_id => form.write_calendar_id.clone().unwrap_or_default(),
             can_manage_resources => auth_user.user.role == "admin",
             can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
             selected_resource_ids => form.resource_ids.clone().unwrap_or_default(),
@@ -8201,6 +8432,8 @@ async fn new_group_event_type_form(
             editing => false,
             is_group => true,
             teams => groups_ctx,
+            write_calendars => writable_calendars_ctx(&state.pool, &user.id).await,
+            form_write_calendar_id => "",
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
             can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
@@ -8335,6 +8568,7 @@ async fn create_group_event_type(
             "Location details are required (e.g. a video call link, phone number, or address).",
             &form,
             false,
+            true,
         )
         .await
         .into_response();
@@ -8450,6 +8684,17 @@ async fn create_group_event_type(
     )
     .await;
 
+    // A team event type is exactly where pinning a shared calendar earns its
+    // keep — a Basecamp project schedule the whole team books into. Ownership
+    // is enforced in the helper: you can only pin a calendar of your own.
+    save_event_type_write_calendar(
+        &state.pool,
+        &et_id,
+        &auth_user.user.id,
+        form.write_calendar_id.as_deref(),
+    )
+    .await;
+
     Redirect::to("/dashboard/event-types").into_response()
 }
 
@@ -8547,6 +8792,16 @@ async fn edit_group_event_type_form(
             .fetch_one(&state.pool)
             .await
             .unwrap_or(0);
+
+    // Pinned write calendar (NULL = each source's default write calendar).
+    let write_calendar_id: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT write_calendar_id FROM event_types WHERE id = ?",
+    )
+    .bind(&et_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None)
+    .flatten();
 
     let form_timezone: String =
         sqlx::query_scalar::<_, Option<String>>("SELECT timezone FROM event_types WHERE id = ?")
@@ -8753,6 +9008,8 @@ async fn edit_group_event_type_form(
             is_group => true,
             form_team_id => team_id,
             original_slug => et_slug,
+            write_calendars => writable_calendars_ctx(&state.pool, &auth_user.user.id).await,
+            form_write_calendar_id => write_calendar_id.clone().unwrap_or_default(),
             resources_all => resources_all,
             can_manage_resources => auth_user.user.role == "admin",
             can_enable_sms => can_enable_sms(&state.pool, &auth_user.user).await,
@@ -8879,6 +9136,7 @@ async fn update_group_event_type(
                 "An event type with this slug already exists in this team.",
                 &form,
                 true,
+                true,
             )
             .await
             .into_response();
@@ -8901,6 +9159,7 @@ async fn update_group_event_type(
             &auth_user,
             "Location details are required (e.g. a video call link, phone number, or address).",
             &form,
+            true,
             true,
         )
         .await
@@ -9036,6 +9295,17 @@ async fn update_group_event_type(
         Some(&team_id),
         &form.resource_ids,
         &form.resource_scheduling_mode,
+    )
+    .await;
+
+    // A team event type is exactly where pinning a shared calendar earns its
+    // keep — a Basecamp project schedule the whole team books into. Ownership
+    // is enforced in the helper: you can only pin a calendar of your own.
+    save_event_type_write_calendar(
+        &state.pool,
+        &et_id,
+        &auth_user.user.id,
+        form.write_calendar_id.as_deref(),
     )
     .await;
 
@@ -15690,6 +15960,17 @@ async fn admin_dashboard(
         .and_then(|c| c.google_oauth2_client_id.clone())
         .unwrap_or_default();
     let google_oauth2_configured = !google_oauth2_client_id.is_empty();
+    let basecamp_oauth2_client_id = auth_config
+        .as_ref()
+        .and_then(|c| c.basecamp_oauth2_client_id.clone())
+        .unwrap_or_default();
+    // "Configured" means connectable: both halves present, same rule the
+    // connect flow enforces.
+    let basecamp_oauth2_configured = !basecamp_oauth2_client_id.is_empty()
+        && auth_config
+            .as_ref()
+            .and_then(|c| c.basecamp_oauth2_client_secret.as_deref())
+            .is_some_and(|s| !s.is_empty());
 
     let (
         smtp_configured,
@@ -15898,6 +16179,8 @@ async fn admin_dashboard(
             oidc_client_id => oidc_client_id,
             oidc_auto_register => oidc_auto_register,
             google_oauth2_client_id => google_oauth2_client_id,
+            basecamp_oauth2_client_id => basecamp_oauth2_client_id,
+            basecamp_oauth2_configured => basecamp_oauth2_configured,
             google_oauth2_configured => google_oauth2_configured,
             base_url => crate::settings::base_url().unwrap_or_default(),
             base_url_db => crate::settings::base_url_db().unwrap_or_default(),
@@ -16911,6 +17194,383 @@ async fn google_callback(
         Redirect::to(&format!("/dashboard/sources/{}/setup-write", source_id))
     } else {
         Redirect::to("/dashboard/sources")
+    };
+    (headers, redirect).into_response()
+}
+
+// --- Basecamp OAuth2 connect flow ---
+
+#[derive(Deserialize)]
+struct AdminBasecampOAuth2Form {
+    _csrf: Option<String>,
+    basecamp_oauth2_client_id: Option<String>,
+    basecamp_oauth2_client_secret: Option<String>,
+}
+
+async fn admin_update_basecamp_oauth2(
+    State(state): State<Arc<AppState>>,
+    _admin: crate::auth::AdminUser,
+    headers: HeaderMap,
+    Form(form): Form<AdminBasecampOAuth2Form>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
+        return resp;
+    }
+    // Trimmed, like the secret below: a pasted id with trailing whitespace
+    // would be percent-encoded into the Launchpad URL and fail there with a
+    // message that says nothing about whitespace.
+    let client_id = form
+        .basecamp_oauth2_client_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Keep-current pattern: an empty secret field preserves the stored one, so
+    // editing the client id doesn't require re-typing the secret.
+    let secret_provided = form
+        .basecamp_oauth2_client_secret
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if secret_provided {
+        let client_secret = form.basecamp_oauth2_client_secret.unwrap_or_default();
+        let encrypted_secret =
+            match crate::crypto::encrypt_value(&state.secret_key, client_secret.trim()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return internal_error_response("encrypt basecamp_oauth2 client_secret", &e)
+                }
+            };
+        let _ = sqlx::query(
+            "UPDATE auth_config SET basecamp_oauth2_client_id = ?, basecamp_oauth2_client_secret = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&client_id)
+        .bind(&encrypted_secret)
+        .execute(&state.pool)
+        .await;
+    } else {
+        let _ = sqlx::query(
+            "UPDATE auth_config SET basecamp_oauth2_client_id = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&client_id)
+        .execute(&state.pool)
+        .await;
+    }
+
+    tracing::info!(admin = %_admin.0.email, "admin: Basecamp OAuth2 config updated");
+    Redirect::to("/dashboard/admin").into_response()
+}
+
+/// Public callback path, also shown in the admin panel so the operator can
+/// paste it into the 37signals app registration.
+pub(crate) fn basecamp_redirect_uri(base_url: &str) -> String {
+    format!(
+        "{}/dashboard/sources/basecamp/callback",
+        base_url.trim_end_matches('/')
+    )
+}
+
+async fn basecamp_connect(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+) -> impl IntoResponse {
+    // Both halves, resolved the same way the callback will resolve them: a
+    // missing secret must fail here, before the user spends an authorization
+    // code on an exchange that cannot succeed.
+    let client_id = match crate::basecamp::oauth::load_client_credentials(
+        &state.pool,
+        &state.secret_key,
+    )
+    .await
+    {
+        Ok((id, _secret)) => id,
+        Err(e) => {
+            tracing::warn!(error = %e, "Basecamp connect refused: app credentials unusable");
+            return Html("Basecamp integration is not fully configured. Ask your administrator to enter both the client ID and the client secret of a 37signals app in the admin panel.".to_string()).into_response();
+        }
+    };
+
+    let base_url = crate::settings::base_url().unwrap_or_default();
+    if base_url.is_empty() {
+        return Html(
+            "The public base URL is not configured. Set it via the CALRS_BASE_URL environment \
+             variable or in the admin panel under System settings before using OAuth2 flows."
+                .to_string(),
+        )
+        .into_response();
+    }
+
+    let csrf_state = uuid::Uuid::new_v4().to_string();
+    let auth_url = crate::basecamp::oauth::build_auth_url(
+        &client_id,
+        &basecamp_redirect_uri(&base_url),
+        &csrf_state,
+    );
+
+    // Same cookie shape as the Google flow: __Host-prefixed, short-lived, and
+    // carrying the initiating user so a tab swap can't land the tokens on
+    // somebody else's account.
+    let cookie_opts = "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600";
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        format!("__Host-calrs_basecamp_state={}{}", csrf_state, cookie_opts)
+            .parse()
+            .unwrap(),
+    );
+    headers.append(
+        axum::http::header::SET_COOKIE,
+        format!(
+            "__Host-calrs_basecamp_user={}{}",
+            auth_user.user.id, cookie_opts
+        )
+        .parse()
+        .unwrap(),
+    );
+
+    (headers, Redirect::to(&auth_url)).into_response()
+}
+
+#[derive(Deserialize)]
+struct BasecampCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn basecamp_callback(
+    State(state): State<Arc<AppState>>,
+    auth_user: crate::auth::AuthUser,
+    jar: axum_extra::extract::CookieJar,
+    Query(query): Query<BasecampCallbackQuery>,
+) -> impl IntoResponse {
+    let clear_opts = "; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+    let mut headers = axum::http::HeaderMap::new();
+    for name in ["__Host-calrs_basecamp_state", "__Host-calrs_basecamp_user"] {
+        headers.append(
+            axum::http::header::SET_COOKIE,
+            format!("{}={}", name, clear_opts).parse().unwrap(),
+        );
+    }
+
+    if let Some(error) = &query.error {
+        // The parameter is attacker-controllable, so it is logged rather than
+        // reflected into the page.
+        tracing::warn!(error = %error, "Basecamp authorization returned an error");
+        return (
+            headers,
+            Html(
+                "Basecamp authorization failed or was declined. You can start the connect flow again from the sources page."
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    }
+
+    let stored_state = jar
+        .get("__Host-calrs_basecamp_state")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default();
+    if stored_state.is_empty() || stored_state != query.state.unwrap_or_default() {
+        return (
+            headers,
+            Html("Invalid state parameter. Please try again.".to_string()),
+        )
+            .into_response();
+    }
+
+    let stored_user = jar
+        .get("__Host-calrs_basecamp_user")
+        .map(|c| c.value().to_string())
+        .unwrap_or_default();
+    if stored_user.is_empty() || stored_user != auth_user.user.id {
+        tracing::warn!(
+            session_user = %auth_user.user.id,
+            cookie_user = %stored_user,
+            "Basecamp OAuth2 callback: user cookie missing or does not match session"
+        );
+        return (
+            headers,
+            Html(
+                "Session changed during Basecamp authorization. Please start the connect flow again."
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    }
+
+    let code = match query.code {
+        Some(c) => c,
+        None => {
+            return (headers, Html("No authorization code received.".to_string())).into_response()
+        }
+    };
+
+    let (client_id, client_secret) =
+        match crate::basecamp::oauth::load_client_credentials(&state.pool, &state.secret_key).await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return (headers, Html(format!("Basecamp is not configured: {}", e)))
+                    .into_response()
+            }
+        };
+
+    let base_url = crate::settings::base_url().unwrap_or_default();
+    let (access_token, refresh_token, expires_in) = match crate::basecamp::oauth::exchange_code(
+        &client_id,
+        &client_secret,
+        &code,
+        &basecamp_redirect_uri(&base_url),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "Basecamp token exchange failed");
+            return (
+                headers,
+                Html("Token exchange with Basecamp failed. Check the app credentials and the redirect URI, then try again.".to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let identity = match crate::basecamp::oauth::fetch_identity(&access_token).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "Basecamp identity lookup failed");
+            return (
+                headers,
+                Html("Could not read your Basecamp account list.".to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let accounts = crate::basecamp::oauth::schedulable_accounts(&identity);
+    if accounts.is_empty() {
+        return (
+            headers,
+            Html(
+                "That Basecamp login has no current-generation Basecamp account, so there is no \
+                 schedule API to read. Older 37signals products (Basecamp Classic, Basecamp 2) \
+                 are not supported."
+                    .to_string(),
+            ),
+        )
+            .into_response();
+    }
+
+    let account_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE user_id = ? LIMIT 1")
+            .bind(&auth_user.user.id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
+    let account_id = match account_id {
+        Some(id) => id,
+        None => return (headers, Html("No scheduling account found.".to_string())).into_response(),
+    };
+
+    let access_enc = match crate::crypto::encrypt_password(&state.secret_key, &access_token) {
+        Ok(e) => e,
+        Err(e) => return internal_error_response("encrypt Basecamp access token", &e),
+    };
+    let refresh_enc = match crate::crypto::encrypt_password(&state.secret_key, &refresh_token) {
+        Ok(e) => e,
+        Err(e) => return internal_error_response("encrypt Basecamp refresh token", &e),
+    };
+    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339();
+
+    // One Basecamp account is one calrs source. A login with access to several
+    // accounts gets a source per account rather than a picker: the tokens are
+    // identity-scoped (the same pair authenticates every one of them), so this
+    // needs no extra state, and an account the host does not schedule from can
+    // simply be removed on the sources page.
+    let mut connected: Vec<(String, String)> = Vec::new();
+    for account in &accounts {
+        let url = crate::basecamp::account_url(&account.id);
+        let name = if accounts.len() == 1 {
+            "Basecamp".to_string()
+        } else {
+            format!("Basecamp — {}", account.name)
+        };
+
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM caldav_sources WHERE account_id = ? AND provider_type = 'basecamp' AND url = ? LIMIT 1",
+        )
+        .bind(&account_id)
+        .bind(&url)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap_or(None);
+
+        match existing {
+            Some((id,)) => {
+                // Reconnect: refresh the stored tokens rather than duplicating
+                // the source (and its write-calendar choice).
+                let _ = sqlx::query(
+                    "UPDATE caldav_sources SET access_token_enc = ?, refresh_token_enc = ?, token_expires_at = ?, username = ?, enabled = 1 WHERE id = ?",
+                )
+                .bind(&access_enc)
+                .bind(&refresh_enc)
+                .bind(&expires_at)
+                .bind(&identity.email)
+                .bind(&id)
+                .execute(&state.pool)
+                .await;
+                tracing::info!(user = %auth_user.user.email, basecamp_account = %account.id, "Basecamp source reconnected");
+                connected.push((id, url.clone()));
+            }
+            None => {
+                let source_id = uuid::Uuid::new_v4().to_string();
+                let _ = sqlx::query(
+                    "INSERT INTO caldav_sources (id, account_id, name, url, username, provider_type, auth_type, oauth2_provider, access_token_enc, refresh_token_enc, token_expires_at)
+                     VALUES (?, ?, ?, ?, ?, 'basecamp', 'oauth2', 'basecamp', ?, ?, ?)",
+                )
+                .bind(&source_id)
+                .bind(&account_id)
+                .bind(&name)
+                .bind(&url)
+                .bind(&identity.email)
+                .bind(&access_enc)
+                .bind(&refresh_enc)
+                .bind(&expires_at)
+                .execute(&state.pool)
+                .await;
+                tracing::info!(user = %auth_user.user.email, basecamp_account = %account.id, "Basecamp source added");
+                connected.push((source_id, url.clone()));
+            }
+        }
+    }
+
+    // Sync each source so its projects show up as calendars right away.
+    let mut calendars = 0usize;
+    for (source_id, url) in &connected {
+        let (_, count) = run_sync_for_source(
+            &state.pool,
+            &state.secret_key,
+            source_id,
+            url,
+            &identity.email,
+            None,
+            "oauth2",
+            Some(&access_enc),
+            Some(&expires_at),
+            crate::providers::factory::kinds::BASECAMP,
+        )
+        .await;
+        calendars += count;
+    }
+
+    // A single source with projects goes straight to the write-calendar
+    // picker — choosing the project to book into is the point of connecting.
+    let redirect = match connected.as_slice() {
+        [(source_id, _)] if calendars > 0 => {
+            Redirect::to(&format!("/dashboard/sources/{}/setup-write", source_id))
+        }
+        _ => Redirect::to("/dashboard/sources"),
     };
     (headers, redirect).into_response()
 }
@@ -20543,45 +21203,150 @@ async fn reschedule_host_profile(
     }
 }
 
-/// Push a confirmed booking to the calendar(s) it belongs to: the assigned
-/// member's, every member's for collective team event types, or the given
-/// user's for personal bookings (see [`booking_write_targets`]).
-async fn caldav_push_booking(
-    pool: &SqlitePool,
-    key: &[u8; 32],
-    user_id: &str,
-    booking_uid: &str,
-    details: &crate::email::BookingDetails,
-) {
-    for target in booking_write_targets(pool, booking_uid, user_id).await {
-        caldav_push_booking_for_user(pool, key, &target, booking_uid, details).await;
+/// One calendar a booking can be written to, with everything needed to talk to
+/// it. Assembled either from a source's default write calendar
+/// (`caldav_sources.write_calendar_href`) or from the calendar an event type
+/// pins via `event_types.write_calendar_id`.
+#[derive(Debug, Clone)]
+struct WriteTarget {
+    source_id: String,
+    url: String,
+    username: String,
+    password_enc: Option<String>,
+    /// Opaque calendar id for the source's provider: a CalDAV href, an EWS
+    /// folder id, or a Basecamp `"{project}/{schedule}"` pair.
+    calendar_href: String,
+    auth_type: String,
+    access_token_enc: Option<String>,
+    token_expires_at: Option<String>,
+    provider_type: String,
+}
+
+type WriteTargetRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+impl WriteTarget {
+    fn from_row(row: WriteTargetRow) -> Self {
+        let (
+            source_id,
+            url,
+            username,
+            password_enc,
+            calendar_href,
+            auth_type,
+            access_token_enc,
+            token_expires_at,
+            provider_type,
+        ) = row;
+        Self {
+            source_id,
+            url,
+            username,
+            password_enc,
+            calendar_href,
+            auth_type,
+            access_token_enc,
+            token_expires_at,
+            provider_type,
+        }
+    }
+
+    fn credentials(&self) -> crate::providers::SourceCredentials<'_> {
+        crate::providers::SourceCredentials {
+            provider_type: &self.provider_type,
+            url: &self.url,
+            username: &self.username,
+            auth_type: &self.auth_type,
+            password_enc: self.password_enc.as_deref(),
+            access_token_enc: self.access_token_enc.as_deref(),
+            token_expires_at: self.token_expires_at.as_deref(),
+        }
     }
 }
 
-/// Push a confirmed booking to ONE user's CalDAV calendar (every source
-/// with a write_calendar_href set for them). Most callers want
-/// [`caldav_push_booking`], which resolves the right user(s) first; this
-/// is for pushes that deliberately target a specific extra calendar
-/// (booking claims).
-async fn caldav_push_booking_for_user(
+/// The calendar this booking's event type pins, plus the user who owns the
+/// source it lives on.
+///
+/// A pin is how "book this event type into *that* calendar" is expressed —
+/// most usefully a Basecamp project's schedule, where the project is the
+/// distinction that matters. It overrides the source default (which stays the
+/// right answer for everything unpinned).
+async fn event_type_pinned_write_target(
     pool: &SqlitePool,
-    key: &[u8; 32],
-    user_id: &str,
     booking_uid: &str,
-    details: &crate::email::BookingDetails,
-) {
-    // Find all sources with write_calendar_href configured for this user
-    let sources: Vec<(
+) -> Option<(String, WriteTarget)> {
+    // sqlx decodes flat tuples only, so the owner id rides in front of the
+    // nine WriteTargetRow columns and is split off below.
+    type PinnedRow = (
         String,
         String,
-        String,
-        Option<String>,
         String,
         String,
         Option<String>,
+        String,
+        String,
+        Option<String>,
         Option<String>,
         String,
-    )> = sqlx::query_as(
+    );
+    let row: Option<PinnedRow> = sqlx::query_as(
+        "SELECT a.user_id, cs.id, cs.url, cs.username, cs.password_enc, c.href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
+         FROM bookings b
+         JOIN event_types et ON et.id = b.event_type_id
+         JOIN calendars c ON c.id = et.write_calendar_id
+         JOIN caldav_sources cs ON cs.id = c.source_id
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE b.uid = ? AND cs.enabled = 1",
+    )
+    .bind(booking_uid)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+
+    row.map(
+        |(owner, id, url, username, password_enc, href, auth_type, access, expires, provider)| {
+            (
+                owner,
+                WriteTarget::from_row((
+                    id,
+                    url,
+                    username,
+                    password_enc,
+                    href,
+                    auth_type,
+                    access,
+                    expires,
+                    provider,
+                )),
+            )
+        },
+    )
+}
+
+/// Every calendar a booking should be written to for one user: the pinned
+/// calendar when that user owns it, otherwise each of their sources' default
+/// write calendars.
+async fn write_targets_for_user(
+    pool: &SqlitePool,
+    booking_uid: &str,
+    user_id: &str,
+) -> Vec<WriteTarget> {
+    if let Some((owner, target)) = event_type_pinned_write_target(pool, booking_uid).await {
+        if owner == user_id {
+            return vec![target];
+        }
+    }
+
+    let rows: Vec<WriteTargetRow> = sqlx::query_as(
         "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
          FROM caldav_sources cs
          JOIN accounts a ON a.id = cs.account_id
@@ -20592,7 +21357,62 @@ async fn caldav_push_booking_for_user(
     .await
     .unwrap_or_default();
 
-    if sources.is_empty() {
+    rows.into_iter().map(WriteTarget::from_row).collect()
+}
+
+/// Push a confirmed booking to the calendar(s) it belongs to: the assigned
+/// member's, every member's for collective team event types, or the given
+/// user's for personal bookings (see [`booking_write_targets`]) — plus the
+/// calendar the event type pins, when that calendar belongs to someone outside
+/// that set.
+async fn caldav_push_booking(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    user_id: &str,
+    booking_uid: &str,
+    details: &crate::email::BookingDetails,
+) {
+    let targets = booking_write_targets(pool, booking_uid, user_id).await;
+    for target in &targets {
+        caldav_push_booking_for_user(pool, key, target, booking_uid, details).await;
+    }
+
+    // A team event type can pin a shared calendar — a Basecamp project's
+    // schedule the whole team books into — that the assigned member does not
+    // own. Their own calendar is still written above (that is what keeps their
+    // availability honest); the pin is honoured here, once, so the shared
+    // calendar gets the booking too.
+    if let Some((owner, pinned)) = event_type_pinned_write_target(pool, booking_uid).await {
+        if !targets.iter().any(|t| t == &owner) {
+            let ics = crate::email::generate_ics_caldav(details);
+            push_booking_to_target(
+                pool,
+                key,
+                &pinned,
+                booking_uid,
+                &ics,
+                HrefRecord::OnlyIfUnclaimed,
+            )
+            .await;
+        }
+    }
+}
+
+/// Push a confirmed booking to ONE user's calendars: the calendar their event
+/// type pins, or every source of theirs with a write calendar configured. Most
+/// callers want [`caldav_push_booking`], which resolves the right user(s)
+/// first; this is for pushes that deliberately target a specific extra
+/// calendar (booking claims).
+async fn caldav_push_booking_for_user(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    user_id: &str,
+    booking_uid: &str,
+    details: &crate::email::BookingDetails,
+) {
+    let targets = write_targets_for_user(pool, booking_uid, user_id).await;
+
+    if targets.is_empty() {
         // Distinguish "user has no sources" (debug) from "user has sources but none
         // are write-configured" (warn). The second case is almost always a misconfig.
         let unconfigured: i64 = sqlx::query_scalar(
@@ -20616,172 +21436,132 @@ async fn caldav_push_booking_for_user(
             // Not debug: for team bookings this is the assigned member,
             // and members usually expect their calendar to be written.
             // Silence here is what made #147 hard to diagnose.
-            tracing::warn!(user_id = %user_id, uid = %booking_uid, "calendar write-back skipped: no enabled CalDAV source for this user");
+            tracing::warn!(user_id = %user_id, uid = %booking_uid, "calendar write-back skipped: no enabled calendar source for this user");
         }
         return;
     }
 
     let ics = crate::email::generate_ics_caldav(details);
-
-    for (
-        source_id,
-        url,
-        username,
-        password_enc,
-        calendar_href,
-        auth_type,
-        access_token_enc,
-        token_expires_at,
-        provider_type,
-    ) in &sources
-    {
-        tracing::debug!(uid = %booking_uid, calendar_href = %calendar_href, provider = %provider_type, "pushing booking to calendar");
-
-        let put_result = if provider_type == crate::providers::factory::kinds::EWS {
-            let enc = match password_enc.as_deref() {
-                Some(e) => e,
-                None => {
-                    tracing::error!(url = %url, "calendar write-back failed: EWS source missing password");
-                    continue;
-                }
-            };
-            let password = match crate::crypto::decrypt_password(key, enc) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not decrypt credentials");
-                    continue;
-                }
-            };
-            let client = match crate::providers::build_provider(
-                provider_type,
-                url,
-                username,
-                &password,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: unknown provider");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
-        } else {
-            let client = match crate::oauth2_caldav::build_client_for_source(
-                pool,
-                key,
-                source_id,
-                url,
-                auth_type,
-                username,
-                password_enc.as_deref(),
-                access_token_enc.as_deref(),
-                token_expires_at.as_deref(),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(url = %url, error = %e, "calendar write-back failed: could not build client");
-                    continue;
-                }
-            };
-            client.put_event(calendar_href, booking_uid, &ics).await
-        };
-
-        if let Err(e) = put_result {
-            tracing::error!(uid = %booking_uid, calendar_href = %calendar_href, error = %e, "calendar write-back failed");
-            continue;
-        }
-
-        tracing::info!(uid = %booking_uid, calendar_href = %calendar_href, "calendar write-back succeeded");
-
-        // Record which calendar href the booking was pushed to (last successful one)
-        let _ = sqlx::query("UPDATE bookings SET caldav_calendar_href = ? WHERE uid = ?")
-            .bind(calendar_href)
-            .bind(booking_uid)
-            .execute(pool)
-            .await;
+    for target in &targets {
+        push_booking_to_target(pool, key, target, booking_uid, &ics, HrefRecord::Claim).await;
     }
 }
 
-/// Delete a booking from a user's CalDAV calendar by looking up their write-enabled source directly.
-/// Used for team bookings where we don't track per-booking caldav_calendar_href.
+/// How a push claims `bookings.caldav_calendar_href`, the handle the delete
+/// path uses to find the event again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HrefRecord {
+    /// A push to a calendar owned by one of the booking's write-target users.
+    /// Theirs is the href the cleanup wants to resolve.
+    Claim,
+    /// A push to a calendar owned by somebody else (an event type's pinned
+    /// project schedule). It must not displace a member's href — but it does
+    /// have to record *something* when no member push wrote one, or the
+    /// booking would look "never pushed" and the entry would survive
+    /// cancellation on the shared schedule.
+    OnlyIfUnclaimed,
+}
+
+/// Write one booking into one calendar.
+async fn push_booking_to_target(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    target: &WriteTarget,
+    booking_uid: &str,
+    ics: &str,
+    record: HrefRecord,
+) {
+    tracing::debug!(uid = %booking_uid, calendar_href = %target.calendar_href, provider = %target.provider_type, "pushing booking to calendar");
+
+    let client = match crate::providers::build_for_source(
+        pool,
+        key,
+        &target.source_id,
+        &target.credentials(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(url = %target.url, error = %e, "calendar write-back failed: could not build client");
+            return;
+        }
+    };
+
+    if let Err(e) = client
+        .put_event(&target.calendar_href, booking_uid, ics)
+        .await
+    {
+        tracing::error!(uid = %booking_uid, calendar_href = %target.calendar_href, error = %e, "calendar write-back failed");
+        return;
+    }
+
+    tracing::info!(uid = %booking_uid, calendar_href = %target.calendar_href, "calendar write-back succeeded");
+
+    record_write_href(pool, target, booking_uid, record).await;
+}
+
+/// Store where a push landed, per [`HrefRecord`]. Split out from the push so
+/// the claiming rules are testable without a live calendar.
+async fn record_write_href(
+    pool: &SqlitePool,
+    target: &WriteTarget,
+    booking_uid: &str,
+    record: HrefRecord,
+) {
+    let sql = match record {
+        HrefRecord::Claim => "UPDATE bookings SET caldav_calendar_href = ? WHERE uid = ?",
+        HrefRecord::OnlyIfUnclaimed => {
+            "UPDATE bookings SET caldav_calendar_href = ? WHERE uid = ? AND caldav_calendar_href IS NULL"
+        }
+    };
+    let _ = sqlx::query(sql)
+        .bind(&target.calendar_href)
+        .bind(booking_uid)
+        .execute(pool)
+        .await;
+}
+
+/// Remove one booking from one calendar.
+async fn delete_booking_from_target(
+    pool: &SqlitePool,
+    key: &[u8; 32],
+    target: &WriteTarget,
+    booking_uid: &str,
+) {
+    let client = match crate::providers::build_for_source(
+        pool,
+        key,
+        &target.source_id,
+        &target.credentials(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(url = %target.url, error = %e, "calendar event delete failed: could not build client");
+            return;
+        }
+    };
+    if let Err(e) = client
+        .delete_event(&target.calendar_href, booking_uid)
+        .await
+    {
+        tracing::error!(uid = %booking_uid, calendar = %target.calendar_href, error = %e, "calendar event delete failed");
+    }
+}
+
+/// Delete a booking from a user's calendars by looking up their write-enabled
+/// sources (and any pinned calendar) directly. Used for team bookings where we
+/// don't track per-booking `caldav_calendar_href`.
 async fn caldav_delete_for_user(
     pool: &SqlitePool,
     key: &[u8; 32],
     user_id: &str,
     booking_uid: &str,
 ) {
-    let sources: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = sqlx::query_as(
-        "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.write_calendar_href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
-         FROM caldav_sources cs
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href IS NOT NULL",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    for (
-        source_id,
-        url,
-        username,
-        password_enc,
-        calendar_href,
-        auth_type,
-        access_token_enc,
-        token_expires_at,
-        provider_type,
-    ) in &sources
-    {
-        let delete_result = if provider_type == crate::providers::factory::kinds::EWS {
-            let enc = match password_enc.as_deref() {
-                Some(e) => e,
-                None => continue,
-            };
-            let password = match crate::crypto::decrypt_password(key, enc) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            let client =
-                match crate::providers::build_provider(provider_type, url, username, &password) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-            client.delete_event(calendar_href, booking_uid).await
-        } else {
-            let client = match crate::oauth2_caldav::build_client_for_source(
-                pool,
-                key,
-                source_id,
-                url,
-                auth_type,
-                username,
-                password_enc.as_deref(),
-                access_token_enc.as_deref(),
-                token_expires_at.as_deref(),
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            client.delete_event(calendar_href, booking_uid).await
-        };
-        if let Err(e) = delete_result {
-            tracing::error!(uid = %booking_uid, user = %user_id, calendar = %calendar_href, error = %e, "calendar event delete failed");
-        }
+    for target in write_targets_for_user(pool, booking_uid, user_id).await {
+        delete_booking_from_target(pool, key, &target, booking_uid).await;
     }
 
     // Remove cached event
@@ -20799,14 +21579,46 @@ async fn caldav_delete_for_user(
     .await;
 }
 
-/// Delete a booking from the host's CalDAV calendar.
+/// Drop the locally cached copy of a booking's event so it stops blocking
+/// availability, across every user the booking was written for.
+async fn clear_cached_booking_event(
+    pool: &SqlitePool,
+    booking_uid: &str,
+    targets: &[String],
+    fallback_user_id: &str,
+) {
+    let mut users: Vec<&str> = targets.iter().map(String::as_str).collect();
+    if users.is_empty() {
+        users.push(fallback_user_id);
+    }
+    for user_id in users {
+        let _ = sqlx::query(
+            "DELETE FROM events WHERE uid = ? AND calendar_id IN (
+                SELECT c.id FROM calendars c
+                JOIN caldav_sources cs ON cs.id = c.source_id
+                JOIN accounts a ON a.id = cs.account_id
+                WHERE a.user_id = ?
+            )",
+        )
+        .bind(booking_uid)
+        .bind(user_id)
+        .execute(pool)
+        .await;
+    }
+}
+
+/// Delete a booking from the host's calendar.
 pub(crate) async fn caldav_delete_booking(
     pool: &SqlitePool,
     key: &[u8; 32],
     user_id: &str,
     booking_uid: &str,
 ) {
-    // Check if this booking was pushed to CalDAV
+    // Check if this booking was pushed to a calendar. Everything below —
+    // including the pinned-calendar release — is conditional on that: a
+    // pending booking that was declined before it was ever confirmed has
+    // nothing on any remote calendar, and probing for it would spend a
+    // round of API calls per cleanup path for nothing.
     let info: Option<(String,)> = sqlx::query_as(
         "SELECT caldav_calendar_href FROM bookings WHERE uid = ? AND caldav_calendar_href IS NOT NULL",
     )
@@ -20826,6 +21638,22 @@ pub(crate) async fn caldav_delete_booking(
     // Resolve whose calendar the event actually lives on (#147): the
     // assigned member's, every member's for collective, else the caller's.
     let targets = booking_write_targets(pool, booking_uid, user_id).await;
+
+    // A pinned calendar can belong to someone outside that set (a shared
+    // Basecamp project schedule); releasing it is not covered by the
+    // per-member cleanup, so do it here.
+    if let Some((owner, pinned)) = event_type_pinned_write_target(pool, booking_uid).await {
+        if !targets.contains(&owner) {
+            delete_booking_from_target(pool, key, &pinned, booking_uid).await;
+            if pinned.calendar_href == calendar_href {
+                // The pin is what claimed the href, which means no member push
+                // ever landed. It has just been released, and resolving this
+                // href against a member's sources would find nothing.
+                clear_cached_booking_event(pool, booking_uid, &targets, user_id).await;
+                return;
+            }
+        }
+    }
     if targets.len() > 1 {
         // Collective: one stored href cannot describe N member calendars;
         // delete by uid from every member's write sources instead.
@@ -20834,37 +21662,36 @@ pub(crate) async fn caldav_delete_booking(
         }
         return;
     }
-    let target = targets.first().map(String::as_str).unwrap_or(user_id);
+    let target_user = targets.first().map(String::as_str).unwrap_or(user_id);
 
-    // Get the source credentials and provider type
-    type SourceRow = (
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    );
-    async fn find_source(pool: &SqlitePool, user: &str, href: &str) -> Option<SourceRow> {
+    /// Find the source that owns the calendar a booking was pushed to.
+    ///
+    /// The stored href is matched against the source's default write calendar
+    /// *or* any calendar known to live on that source — the second arm is what
+    /// resolves a booking written to an event type's pinned calendar, which by
+    /// definition is not the source default.
+    async fn find_source(pool: &SqlitePool, user: &str, href: &str) -> Option<WriteTargetRow> {
         sqlx::query_as(
-            "SELECT cs.id, cs.url, cs.username, cs.password_enc, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
+            "SELECT cs.id, cs.url, cs.username, cs.password_enc, ? AS href, cs.auth_type, cs.access_token_enc, cs.token_expires_at, cs.provider_type
              FROM caldav_sources cs
              JOIN accounts a ON a.id = cs.account_id
-             WHERE a.user_id = ? AND cs.enabled = 1 AND cs.write_calendar_href = ?
+             WHERE a.user_id = ? AND cs.enabled = 1
+               AND (cs.write_calendar_href = ?
+                    OR EXISTS (SELECT 1 FROM calendars c WHERE c.source_id = cs.id AND c.href = ?))
              LIMIT 1",
         )
+        .bind(href)
         .bind(user)
+        .bind(href)
         .bind(href)
         .fetch_optional(pool)
         .await
         .unwrap_or(None)
     }
 
-    let mut cache_user = target;
-    let mut source = find_source(pool, target, &calendar_href).await;
-    if source.is_none() && target != user_id {
+    let mut cache_user = target_user;
+    let mut source = find_source(pool, target_user, &calendar_href).await;
+    if source.is_none() && target_user != user_id {
         // Pre-#147 bookings were pushed to the event type owner's
         // calendar; the stored href then belongs to them, not the
         // assigned member. Clean up where the event actually is.
@@ -20874,64 +21701,19 @@ pub(crate) async fn caldav_delete_booking(
         }
     }
 
-    let (
-        source_id,
-        url,
-        username,
-        password_enc,
-        auth_type,
-        access_token_enc,
-        token_expires_at,
-        provider_type,
-    ) = match source {
-        Some(s) => s,
+    let target = match source {
+        Some(row) => WriteTarget::from_row(row),
         None => {
             // The href no longer matches any write source (write calendar
             // changed since the push). Best effort: delete by uid from the
             // target's current write sources.
-            tracing::warn!(uid = %booking_uid, user_id = %target, href = %calendar_href, "calendar delete: stored href matches no write source, falling back to delete-by-uid");
-            caldav_delete_for_user(pool, key, target, booking_uid).await;
+            tracing::warn!(uid = %booking_uid, user_id = %target_user, href = %calendar_href, "calendar delete: stored href matches no write source, falling back to delete-by-uid");
+            caldav_delete_for_user(pool, key, target_user, booking_uid).await;
             return;
         }
     };
 
-    let delete_result = if provider_type == crate::providers::factory::kinds::EWS {
-        let enc = match password_enc.as_deref() {
-            Some(e) => e,
-            None => return,
-        };
-        let password = match crate::crypto::decrypt_password(key, enc) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        let client =
-            match crate::providers::build_provider(&provider_type, &url, &username, &password) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-        client.delete_event(&calendar_href, booking_uid).await
-    } else {
-        let client = match crate::oauth2_caldav::build_client_for_source(
-            pool,
-            key,
-            &source_id,
-            &url,
-            &auth_type,
-            &username,
-            password_enc.as_deref(),
-            access_token_enc.as_deref(),
-            token_expires_at.as_deref(),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        client.delete_event(&calendar_href, booking_uid).await
-    };
-    if let Err(e) = delete_result {
-        tracing::error!(uid = %booking_uid, error = %e, "calendar event delete failed");
-    }
+    delete_booking_from_target(pool, key, &target, booking_uid).await;
 
     // Also remove the cached event from local DB so it doesn't block availability
     let _ = sqlx::query(
@@ -23244,6 +24026,468 @@ mod tests {
             booking_write_targets(&pool, &uid3, &owner).await,
             vec![owner]
         );
+    }
+
+    /// Seed a source with a default write calendar plus one extra calendar,
+    /// for the write-target tests. Returns `(source_id, default_href,
+    /// extra_calendar_id, extra_href)`.
+    async fn seed_write_source(
+        pool: &SqlitePool,
+        user_id: &str,
+        provider_type: &str,
+    ) -> (String, String, String, String) {
+        let account_id: String = sqlx::query_scalar("SELECT id FROM accounts WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let source_id = uuid::Uuid::new_v4().to_string();
+        let default_href = "/calendars/default/".to_string();
+        sqlx::query(
+            "INSERT INTO caldav_sources (id, account_id, name, url, username, password_enc, provider_type, write_calendar_href) \
+             VALUES (?, ?, 'Seeded', 'https://3.basecampapi.com/1234567', 'u', 'enc', ?, ?)",
+        )
+        .bind(&source_id)
+        .bind(&account_id)
+        .bind(provider_type)
+        .bind(&default_href)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let extra_id = uuid::Uuid::new_v4().to_string();
+        let extra_href = "2085958499/1069479342".to_string();
+        sqlx::query(
+            "INSERT INTO calendars (id, source_id, href, display_name) VALUES (?, ?, ?, 'Sales project')",
+        )
+        .bind(&extra_id)
+        .bind(&source_id)
+        .bind(&extra_href)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (source_id, default_href, extra_id, extra_href)
+    }
+
+    /// Without a pin, a booking is written to each source's default write
+    /// calendar — the behaviour every existing deployment relies on.
+    #[tokio::test]
+    async fn write_targets_default_to_the_source_write_calendar() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_source, default_href, _cal, _href) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::CALDAV).await;
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let targets = write_targets_for_user(&pool, &uid, &owner).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].calendar_href, default_href);
+    }
+
+    /// A pinned calendar replaces the source default for that event type —
+    /// this is what selects the Basecamp project a booking is created in.
+    #[tokio::test]
+    async fn pinned_write_calendar_overrides_the_source_default() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_source, default_href, cal_id, pinned_href) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&cal_id)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (pin_owner, pinned) = event_type_pinned_write_target(&pool, &uid).await.unwrap();
+        assert_eq!(pin_owner, owner);
+        assert_eq!(pinned.calendar_href, pinned_href);
+        assert_eq!(pinned.provider_type, "basecamp");
+
+        let targets = write_targets_for_user(&pool, &uid, &owner).await;
+        assert_eq!(targets.len(), 1, "the pin replaces, it does not add");
+        assert_eq!(targets[0].calendar_href, pinned_href);
+        assert_ne!(targets[0].calendar_href, default_href);
+    }
+
+    /// A disabled source must not be written to, pin or no pin: disabling a
+    /// source is how a host takes it out of service.
+    #[tokio::test]
+    async fn pinned_write_calendar_on_a_disabled_source_is_ignored() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (source_id, _default_href, cal_id, _href) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&cal_id)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE caldav_sources SET enabled = 0 WHERE id = ?")
+            .bind(&source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert!(event_type_pinned_write_target(&pool, &uid).await.is_none());
+        assert!(write_targets_for_user(&pool, &uid, &owner).await.is_empty());
+    }
+
+    /// The picker only offers calendars the editing user owns, and the handler
+    /// enforces that: a posted id belonging to someone else is refused, and
+    /// the stored value is left alone.
+    #[tokio::test]
+    async fn save_write_calendar_rejects_a_calendar_the_user_does_not_own() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let stranger = insert_role_user(&pool, "stranger@bc.test", "user").await;
+        insert_personal_et(&pool, &stranger, "stranger-et").await;
+        let (_s, _d, stranger_cal, _h) =
+            seed_write_source(&pool, &stranger, crate::providers::factory::kinds::BASECAMP).await;
+
+        save_event_type_write_calendar(&pool, &et_id, &owner, Some(&stranger_cal)).await;
+
+        let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT write_calendar_id FROM event_types WHERE id = ?",
+        )
+        .bind(&et_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stored.is_none(), "another user's calendar must not be set");
+    }
+
+    /// Editing an event type without touching the picker must not silently
+    /// drop a pin the editor cannot see (a team-mate's, or an admin's).
+    #[tokio::test]
+    async fn save_write_calendar_keeps_a_pin_the_editor_cannot_see() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_s, _d, owner_cal, _h) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::BASECAMP).await;
+        save_event_type_write_calendar(&pool, &et_id, &owner, Some(&owner_cal)).await;
+
+        // A different member submits the form with an empty picker.
+        let other = insert_role_user(&pool, "other@bc.test", "user").await;
+        save_event_type_write_calendar(&pool, &et_id, &other, None).await;
+        let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT write_calendar_id FROM event_types WHERE id = ?",
+        )
+        .bind(&et_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some(owner_cal.as_str()));
+
+        // The owner clearing it does take effect.
+        save_event_type_write_calendar(&pool, &et_id, &owner, None).await;
+        let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT write_calendar_id FROM event_types WHERE id = ?",
+        )
+        .bind(&et_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(stored.is_none());
+    }
+
+    /// A booking that was never pushed must not trigger any remote cleanup —
+    /// not even the pinned-calendar release. Declining a pending booking is the
+    /// common case, and on a Basecamp pin the probe alone is a page walk.
+    #[tokio::test]
+    async fn delete_booking_skips_remote_work_when_never_pushed() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_source, _default_href, cal_id, _href) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&cal_id)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "pending").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // caldav_calendar_href is NULL (never pushed). The URL points at
+        // 3.basecampapi.com, so any request attempt would be a live call; the
+        // test passing quickly with no panic is the assertion that none is made.
+        caldav_delete_booking(&pool, &[7u8; 32], &owner, &uid).await;
+
+        let status: String = sqlx::query_scalar("SELECT status FROM bookings WHERE uid = ?")
+            .bind(&uid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending", "cleanup must not touch the booking row");
+    }
+
+    /// The href recorded on a booking must describe the assigned member's
+    /// calendar, because that is what the delete path resolves back to a
+    /// source. A foreign pin pushed alongside it must not claim the slot.
+    #[tokio::test]
+    async fn recorded_href_survives_a_foreign_pinned_push() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_s, member_href, _c, _h) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::CALDAV).await;
+
+        // The pin belongs to somebody else — a shared project schedule.
+        let other = insert_role_user(&pool, "shared@bc.test", "user").await;
+        insert_personal_et(&pool, &other, "shared-et").await;
+        let (_s2, _d2, pinned_cal, pinned_href) =
+            seed_write_source(&pool, &other, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&pinned_cal)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // The pin is not the owner's, so their own source default still applies
+        // to them, and the pin is an extra target resolved separately.
+        let targets = write_targets_for_user(&pool, &uid, &owner).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].calendar_href, member_href);
+
+        let (pin_owner, pinned) = event_type_pinned_write_target(&pool, &uid).await.unwrap();
+        assert_eq!(pin_owner, other);
+        assert_eq!(pinned.calendar_href, pinned_href);
+        assert_ne!(
+            pinned.calendar_href, member_href,
+            "the two pushes must target different calendars for the flag to matter"
+        );
+    }
+
+    /// Regression: a booking whose only successful push was the foreign pin
+    /// must still count as pushed. Otherwise `caldav_delete_booking` returns at
+    /// the never-pushed guard and the entry survives cancellation on the shared
+    /// schedule, blocking availability forever.
+    #[tokio::test]
+    async fn foreign_pin_claims_the_href_when_no_member_push_did() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+
+        // The owner has no source at all, so no member push can record an href.
+        let other = insert_role_user(&pool, "shared2@bc.test", "user").await;
+        insert_personal_et(&pool, &other, "shared2-et").await;
+        let (_s, _d, pinned_cal, pinned_href) =
+            seed_write_source(&pool, &other, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&pinned_cal)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert!(
+            write_targets_for_user(&pool, &uid, &owner).await.is_empty(),
+            "the owner must have no write target for this test to mean anything"
+        );
+
+        // OnlyIfUnclaimed on a NULL href records it...
+        let (_, pinned) = event_type_pinned_write_target(&pool, &uid).await.unwrap();
+        record_write_href(&pool, &pinned, &uid, HrefRecord::OnlyIfUnclaimed).await;
+        let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT caldav_calendar_href FROM bookings WHERE uid = ?",
+        )
+        .bind(&uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some(pinned_href.as_str()));
+    }
+
+    /// ...and never displaces a member's href, which is the handle the delete
+    /// path resolves against that member's own sources.
+    #[tokio::test]
+    async fn foreign_pin_never_displaces_a_member_href() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_s, member_href, _c, _h) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::CALDAV).await;
+
+        let other = insert_role_user(&pool, "shared3@bc.test", "user").await;
+        insert_personal_et(&pool, &other, "shared3-et").await;
+        let (_s2, _d2, pinned_cal, pinned_href) =
+            seed_write_source(&pool, &other, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&pinned_cal)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // The member push lands first and claims the href.
+        let member_target = write_targets_for_user(&pool, &uid, &owner)
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        record_write_href(&pool, &member_target, &uid, HrefRecord::Claim).await;
+
+        // The pin push must leave it alone.
+        let (_, pinned) = event_type_pinned_write_target(&pool, &uid).await.unwrap();
+        record_write_href(&pool, &pinned, &uid, HrefRecord::OnlyIfUnclaimed).await;
+
+        let stored: Option<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT caldav_calendar_href FROM bookings WHERE uid = ?",
+        )
+        .bind(&uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some(member_href.as_str()));
+        assert_ne!(stored.as_deref(), Some(pinned_href.as_str()));
+    }
+
+    /// A team event type is the case the pin exists for, and its own handlers
+    /// must be able to store one.
+    #[tokio::test]
+    async fn team_event_types_can_store_a_pinned_write_calendar() {
+        let pool = setup_test_db().await;
+        let alice = insert_role_user(&pool, "alice@bcteam.test", "user").await;
+        let (_team, et_id) =
+            insert_team_with_et(&pool, "bcteam", "bcteam-et", &[(&alice, "admin")]).await;
+        insert_personal_et(&pool, &alice, "alice-personal").await;
+        let (_s, _d, cal_id, href) =
+            seed_write_source(&pool, &alice, crate::providers::factory::kinds::BASECAMP).await;
+
+        save_event_type_write_calendar(&pool, &et_id, &alice, Some(&cal_id)).await;
+
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, Some(&alice), start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (pin_owner, pinned) = event_type_pinned_write_target(&pool, &uid).await.unwrap();
+        assert_eq!(pin_owner, alice);
+        assert_eq!(pinned.calendar_href, href);
+    }
+
+    /// Deleting a calendar must fall back to the source default rather than
+    /// leave a dangling pin that drops write-back silently (migration 064's
+    /// ON DELETE SET NULL).
+    #[tokio::test]
+    async fn deleting_a_pinned_calendar_falls_back_to_the_source_default() {
+        let pool = setup_test_db().await;
+        let (owner, _, et_id) = seed_test_data(&pool).await;
+        let (_source, default_href, cal_id, _href) =
+            seed_write_source(&pool, &owner, crate::providers::factory::kinds::BASECAMP).await;
+        sqlx::query("UPDATE event_types SET write_calendar_id = ? WHERE id = ?")
+            .bind(&cal_id)
+            .bind(&et_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM calendars WHERE id = ?")
+            .bind(&cal_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let start = NaiveDate::from_ymd_opt(2026, 3, 17)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        insert_booking(&pool, &et_id, None, start, "confirmed").await;
+        let uid: String =
+            sqlx::query_scalar("SELECT uid FROM bookings WHERE event_type_id = ? LIMIT 1")
+                .bind(&et_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert!(event_type_pinned_write_target(&pool, &uid).await.is_none());
+        let targets = write_targets_for_user(&pool, &uid, &owner).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].calendar_href, default_href);
     }
 
     /// Reschedule availability must be checked against the booking's real

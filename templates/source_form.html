@@ -6,7 +6,7 @@
 
 <div class="card">
   <h1>{% if editing %}Edit calendar source{% else %}Connect a calendar{% endif %}</h1>
-  <p class="subtitle">{% if editing %}Update the connection. Leave the password blank to keep the existing one. After changing the URL or username, run a sync to refresh the discovered calendar list.{% else %}Connect a CalDAV server or Microsoft Exchange (EWS) so calrs can check availability when guests book meetings.{% endif %}</p>
+  <p class="subtitle">{% if editing %}Update the connection. Leave the password blank to keep the existing one. After changing the URL or username, run a sync to refresh the discovered calendar list.{% else %}Connect a CalDAV server, Microsoft Exchange (EWS) or Basecamp so calrs can check availability when guests book meetings.{% endif %}</p>
 
   {% if error %}
     <div class="error" style="margin-top: 1rem;">{{ error }}</div>
@@ -18,9 +18,11 @@
       <select id="provider_type" name="provider_type" style="padding: 0.625rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.925rem; font-family: inherit; background: var(--surface); color: var(--text); width: 100%;">
         <option value="caldav" {% if form_provider_type == "caldav" %}selected{% endif %}>CalDAV</option>
         <option value="ews" {% if form_provider_type == "ews" %}selected{% endif %}>Microsoft Exchange (EWS)</option>
+        <option value="basecamp" {% if form_provider_type == "basecamp" %}selected{% endif %}>Basecamp</option>
       </select>
       <small style="display:block; margin-top: 0.25rem; color: var(--text-muted); font-size: 0.825rem;">
-        Pick the protocol your server speaks. EWS targets on-prem Exchange 2019/2016/2013.
+        Pick the protocol your server speaks. EWS targets on-prem Exchange 2019/2016/2013;
+        Basecamp connects over OAuth and maps each project's schedule to a calendar.
       </small>
     </div>
 
@@ -79,6 +81,17 @@
         Username is the mailbox email; password must accept HTTP Basic over TLS (enable on a service mailbox if your tenant disabled Basic).<br>
         Make sure to also pick <strong>Microsoft Exchange (EWS)</strong> in the Backend dropdown above.
       </div>
+      <div id="help-basecamp" class="provider-help-text" style="display: none;">
+        <strong>Basecamp</strong>: Connect via OAuth2. No password needed.<br>
+        Every Basecamp project whose <strong>Schedule</strong> is enabled becomes a calendar:
+        its entries can block your availability, and confirmed bookings can be written back
+        into the project schedule you pick.<br>
+        {% if basecamp_oauth2_configured %}
+        Click the button below to authorize calrs.
+        {% else %}
+        <span style="color: var(--error-text);">Basecamp integration is not configured yet. Ask your administrator to register a 37signals app in the admin panel.</span>
+        {% endif %}
+      </div>
       <div id="help-other" class="provider-help-text" style="display: none;">
         Enter your CalDAV server's <strong>DAV root URL</strong> — not a specific calendar or public link.<br>
         calrs will auto-discover your calendars via PROPFIND (RFC 4791).
@@ -90,6 +103,14 @@
       <a href="/dashboard/sources/google/connect" class="btn" style="display: inline-block; text-decoration: none;">Connect with Google</a>
       {% else %}
       <p style="color: var(--text-muted); font-size: 0.875rem;">Google Calendar is not available. Contact your administrator.</p>
+      {% endif %}
+    </div>
+
+    <div id="basecamp-connect" style="display: none; margin-bottom: 1rem;">
+      {% if basecamp_oauth2_configured %}
+      <a href="/dashboard/sources/basecamp/connect" class="btn" style="display: inline-block; text-decoration: none;">Connect with Basecamp</a>
+      {% else %}
+      <p style="color: var(--text-muted); font-size: 0.875rem;">Basecamp is not available. Contact your administrator.</p>
       {% endif %}
     </div>
 
@@ -177,6 +198,8 @@
   function updateUrlLabel() {
     if (typeSelect.value === 'ews') {
       urlLabel.textContent = 'EWS endpoint URL';
+    } else if (typeSelect.value === 'basecamp') {
+      urlLabel.textContent = 'Basecamp account URL';
     } else {
       urlLabel.textContent = 'CalDAV URL';
     }
@@ -188,6 +211,10 @@
     var id = opt.value;
     var url = opt.getAttribute('data-url');
     var isGoogle = (id === 'google');
+    // OAuth-only back-ends have no credentials to type: the connect button
+    // replaces the whole form.
+    var isBasecamp = (id === 'basecamp');
+    var isOauthOnly = isGoogle || isBasecamp;
 
     // Auto-fill URL only if user hasn't entered their own value
     if (autoFill && url && !userEdited) {
@@ -204,9 +231,10 @@
     var help = document.getElementById('help-' + id);
     if (help) help.style.display = 'block';
 
-    // Toggle Google connect button vs basic auth fields
+    // Toggle OAuth connect buttons vs basic auth fields
     document.getElementById('google-connect').style.display = isGoogle ? 'block' : 'none';
-    document.getElementById('basic-auth-fields').style.display = isGoogle ? 'none' : 'block';
+    document.getElementById('basecamp-connect').style.display = isBasecamp ? 'block' : 'none';
+    document.getElementById('basic-auth-fields').style.display = isOauthOnly ? 'none' : 'block';
 
     updateUrlLabel();
   }

@@ -500,6 +500,23 @@
     </div>
     {% endif %}
 
+    {% if write_calendars is defined and write_calendars %}
+    <div style="border-top: 1px solid var(--border); padding-top: 1rem; margin-top: 0.75rem;">
+      <label for="write_calendar_id" style="font-weight: 600; font-size: 0.925rem; display: block; margin-bottom: 0.5rem;">Write bookings to</label>
+      <span class="hint" style="font-size: 0.825rem; color: var(--text-muted); display: block; margin-bottom: 0.75rem;">
+        Where confirmed bookings for this event type are created. Leave on the default to use
+        each calendar source's own write calendar. Pick a calendar to override it — for a
+        Basecamp source, that is the project whose schedule the meeting should appear in.
+      </span>
+      <select id="write_calendar_id" name="write_calendar_id" style="padding: 0.625rem 0.75rem; border: 1px solid var(--border); border-radius: var(--radius); font-size: 0.925rem; font-family: inherit; background: var(--surface); color: var(--text); width: 100%;">
+        <option value="">Source default</option>
+        {% for cal in write_calendars %}
+          <option value="{{ cal.id }}" {% if cal.id == form_write_calendar_id %}selected{% endif %}>{{ cal.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% endif %}
+
     {% if resources_all is defined and resources_all %}
     <div style="border-top: 1px solid var(--border); padding-top: 1rem; margin-top: 0.75rem;">
       <label style="font-weight: 600; font-size: 0.925rem; display: block; margin-bottom: 0.5rem;">{{ t("event-type-form-resources-label") }}</label>

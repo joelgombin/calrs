@@ -382,6 +382,35 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   </form>
 </div>
 
+<!-- Basecamp OAuth2 -->
+<div class="card">
+  <h2>Basecamp (OAuth2)</h2>
+  <div style="margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
+    Status: {% if basecamp_oauth2_configured %}<strong style="color: var(--success);">configured</strong>{% elif basecamp_oauth2_client_id %}<span style="color: var(--error-text);">incomplete — client secret missing</span>{% else %}<span style="color: var(--text-muted);">not configured</span>{% endif %}
+    {% if basecamp_oauth2_client_id %}&middot; Client ID: <span style="color: var(--text-muted);">{{ basecamp_oauth2_client_id }}</span>{% endif %}
+  </div>
+  <form method="post" action="/dashboard/admin/basecamp-oauth2">
+    <p style="font-size: 0.825rem; color: var(--text-muted); margin-bottom: 1rem;">
+      Register an app at
+      <a href="https://launchpad.37signals.com/integrations" target="_blank" style="color: var(--accent);">37signals Integrations</a>,
+      then add
+      <code>{{ base_url }}/dashboard/sources/basecamp/callback</code>
+      as its redirect URI. Once saved, users connect their own Basecamp from
+      <strong>Calendar sources</strong>: each Basecamp project's schedule becomes a
+      calendar that can block availability and receive confirmed bookings.
+    </p>
+    <div class="form-group">
+      <label>Client ID</label>
+      <input type="text" name="basecamp_oauth2_client_id" value="{{ basecamp_oauth2_client_id }}" placeholder="4e0d0e1f2a...">
+    </div>
+    <div class="form-group">
+      <label>Client secret <span class="hint">(leave empty to keep current)</span></label>
+      <input type="password" name="basecamp_oauth2_client_secret" value="" placeholder="Leave empty to keep unchanged">
+    </div>
+    <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600; color: var(--accent); border-color: var(--accent);">Save Basecamp OAuth2 settings</button>
+  </form>
+</div>
+
 <!-- Captcha settings -->
 <div class="card">
   <h2>Captcha</h2>
